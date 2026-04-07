@@ -1,0 +1,148 @@
+import 'dotenv/config';
+import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
+import jwt from '@fastify/jwt';
+import rateLimit from '@fastify/rate-limit';
+import multipart from '@fastify/multipart';
+import { prisma } from './shared/utils/prisma';
+import { redis } from './shared/utils/redis';
+import { logger } from './shared/utils/logger';
+import { AppError } from './shared/errors/AppError';
+
+// Routes
+import { uploadRoutes } from './modules/upload/upload.routes';
+import { authRoutes } from './modules/auth/auth.routes';
+import { producerRoutes } from './modules/producers/producers.routes';
+import { productRoutes } from './modules/products/products.routes';
+import { offerRoutes } from './modules/offers/offers.routes';
+import { gatewayRoutes } from './modules/gateway/gateway.routes';
+import { checkoutRoutes } from './modules/checkout/checkout.routes';
+import { affiliateRoutes } from './modules/affiliates/affiliates.routes';
+import { coproducerRoutes } from './modules/coproducers/coproducers.routes';
+import { subscriptionRoutes } from './modules/subscriptions/subscriptions.routes';
+import { logisticsRoutes } from './modules/logistics/logistics.routes';
+import { financialRoutes } from './modules/financial/financial.routes';
+import { webhookRoutes } from './modules/webhooks/webhooks.routes';
+import { reportRoutes } from './modules/reports/reports.routes';
+import { auditRoutes } from './modules/audit/audit.routes';
+import { adminRoutes } from './modules/admin/admin.routes';
+
+// Queue workers
+import { startWorkers } from './shared/queue/workers';
+
+const app = Fastify({
+  logger: process.env.NODE_ENV === 'production'
+    ? { level: 'info' }
+    : { level: 'debug', transport: { target: 'pino-pretty' } },
+  trustProxy: true,
+});
+
+async function bootstrap() {
+  // ── PLUGINS ──────────────────────────────────────────────────
+  await app.register(cors, {
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    credentials: true,
+  });
+
+  await app.register(helmet, {
+    contentSecurityPolicy: false,
+    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+  });
+
+  await app.register(jwt, {
+    secret: process.env.JWT_SECRET!,
+    sign: { expiresIn: process.env.JWT_EXPIRES_IN || '15m' },
+  });
+
+  await app.register(rateLimit, {
+    global: true,
+    max: 200,
+    timeWindow: 60000,
+    keyGenerator: (req) => req.ip,
+    errorResponseBuilder: () => ({
+      statusCode: 429,
+      error: 'Too Many Requests',
+      message: 'Limite de requisições atingido. Tente novamente em 1 minuto.',
+    }),
+  });
+
+  await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
+
+  // ── GLOBAL ERROR HANDLER ─────────────────────────────────────
+  app.setErrorHandler((error, _request, reply) => {
+    if (error instanceof AppError) {
+      return reply.status(error.statusCode).send({
+        statusCode: error.statusCode,
+        error: error.name,
+        message: error.message,
+      });
+    }
+
+    if (error.validation) {
+      return reply.status(400).send({
+        statusCode: 400,
+        error: 'Validation Error',
+        message: error.message,
+        details: error.validation,
+      });
+    }
+
+    logger.error(error, 'Unhandled error');
+    return reply.status(500).send({
+      statusCode: 500,
+      error: 'Internal Server Error',
+      message: 'Ocorreu um erro interno. Tente novamente.',
+    });
+  });
+
+  // ── HEALTH CHECK ─────────────────────────────────────────────
+  app.get('/health', async () => ({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    version: process.env.npm_package_version || '1.0.0',
+  }));
+
+  // ── ROUTES ───────────────────────────────────────────────────
+  await app.register(uploadRoutes,       { prefix: '/upload' });
+  await app.register(authRoutes,         { prefix: '/auth' });
+  await app.register(producerRoutes,     { prefix: '/producers' });
+  await app.register(productRoutes,      { prefix: '/products' });
+  await app.register(offerRoutes,        { prefix: '/offers' });
+  await app.register(gatewayRoutes,      { prefix: '/gateway' });
+  await app.register(checkoutRoutes,     { prefix: '/checkout' });
+  await app.register(affiliateRoutes,    { prefix: '/affiliates' });
+  await app.register(coproducerRoutes,   { prefix: '/coproducers' });
+  await app.register(subscriptionRoutes, { prefix: '/subscriptions' });
+  await app.register(logisticsRoutes,    { prefix: '/logistics' });
+  await app.register(financialRoutes,    { prefix: '/financial' });
+  await app.register(webhookRoutes,      { prefix: '/webhooks' });
+  await app.register(reportRoutes,       { prefix: '/reports' });
+  await app.register(auditRoutes,        { prefix: '/audit' });
+  await app.register(adminRoutes,        { prefix: '/admin' });
+
+  // ── START QUEUE WORKERS ──────────────────────────────────────
+  await startWorkers();
+
+  // ── START SERVER ─────────────────────────────────────────────
+  const port = Number(process.env.PORT) || 3000;
+  await app.listen({ port, host: '0.0.0.0' });
+  logger.info(`🚀 Kairos Way API rodando na porta ${port}`);
+}
+
+// Graceful shutdown
+const signals = ['SIGINT', 'SIGTERM'] as const;
+signals.forEach((signal) => {
+  process.on(signal, async () => {
+    logger.info(`Recebido ${signal}, desligando...`);
+    await app.close();
+    await prisma.$disconnect();
+    redis.disconnect();
+    process.exit(0);
+  });
+});
+
+bootstrap().catch((err) => {
+  logger.error(err, 'Falha ao iniciar o servidor');
+  process.exit(1);
+});

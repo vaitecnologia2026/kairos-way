@@ -1,0 +1,697 @@
+// Kairos Way — Schema Prisma Completo
+// Versão 1.0 — Março/2026
+
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+  url = env("DATABASE_URL")
+}
+// ══════════════════════════════════════════════════════
+// ENUMS
+// ══════════════════════════════════════════════════════
+
+enum Role {
+  ADMIN
+  STAFF
+  PRODUCER
+  COPRODUCER
+  AFFILIATE
+}
+
+enum StaffRole {
+  FINANCIAL
+  SUPPORT
+  MODERATOR
+}
+
+enum KycStatus {
+  PENDING
+  DOCUMENTS_SENT
+  APPROVED
+  REJECTED
+}
+
+enum ProductType {
+  PHYSICAL
+  DIGITAL
+  SUBSCRIPTION
+  BUNDLE
+}
+
+enum ProductStatus {
+  PENDING
+  REVIEW
+  APPROVED
+  REJECTED
+  INACTIVE
+}
+
+enum OfferType {
+  STANDARD
+  UPSELL
+  ORDERBUMP
+  SUBSCRIPTION
+}
+
+enum RecipientType {
+  PLATFORM
+  PRODUCER
+  COPRODUCER
+  AFFILIATE
+}
+
+enum SplitStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+}
+
+enum OrderStatus {
+  PENDING
+  PROCESSING
+  APPROVED
+  REJECTED
+  REFUNDED
+  CHARGEBACK
+  CANCELLED
+}
+
+enum PaymentMethod {
+  PIX
+  CREDIT_CARD
+  DEBIT_CARD
+  BOLETO
+}
+
+enum AcquirerName {
+  PAGARME
+  ASAAS
+  STONE
+  CIELO
+}
+
+enum SubStatus {
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+}
+
+enum SubCycle {
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  QUARTERLY
+  SEMIANNUAL
+  ANNUAL
+}
+
+enum ShipStatus {
+  WAITING
+  DISPATCHED
+  IN_TRANSIT
+  DELIVERED
+  RETURNED
+}
+
+enum WebhookStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum AuditLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum WithdrawStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+}
+
+// ══════════════════════════════════════════════════════
+// AUTH / USERS
+// ══════════════════════════════════════════════════════
+
+model User {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  passwordHash   String
+  role           Role
+  name           String
+  document       String?
+  avatarUrl      String?
+  birthDate      DateTime?
+  phone          String?
+  pixKey         String?
+  pixKeyType     String?
+  mfaSecret      String?
+  mfaEnabled     Boolean   @default(false)
+  failedAttempts Int       @default(0)
+  lockedUntil    DateTime?
+  lastLoginAt    DateTime?
+  lastLoginIp    String?
+  isActive       Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  sessions      Session[]
+  producer      Producer?
+  affiliate     Affiliate?
+  coproducer    Coproducer?
+  staffMember   StaffMember?
+  auditLogs     AuditLog[]
+  pushTokens    PushToken[]
+
+  @@index([email])
+  @@index([role])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  accessToken  String   @unique
+  refreshToken String   @unique
+  expiresAt    DateTime
+  ip           String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([refreshToken])
+}
+
+model StaffMember {
+  id         String    @id @default(cuid())
+  userId     String    @unique
+  staffRole  StaffRole
+  invitedBy  String?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ══════════════════════════════════════════════════════
+// PRODUCERS
+// ══════════════════════════════════════════════════════
+
+model Producer {
+  id            String    @id @default(cuid())
+  userId        String    @unique
+  companyName   String?
+  tradeName     String?
+  kycStatus     KycStatus @default(PENDING)
+  bankData      Json?
+  isActive      Boolean   @default(false)
+  approvedAt    DateTime?
+  approvedBy    String?
+  rejectedAt    DateTime?
+  rejectedBy    String?
+  rejectedReason String?
+  metadata      Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  user           User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  products       Product[]
+  kycDocuments   KycDocument[]
+
+  @@index([kycStatus])
+  @@index([isActive])
+}
+
+model KycDocument {
+  id          String   @id @default(cuid())
+  producerId  String
+  type        String
+  url         String
+  uploadedAt  DateTime @default(now())
+
+  producer Producer @relation(fields: [producerId], references: [id], onDelete: Cascade)
+}
+
+// ══════════════════════════════════════════════════════
+// PRODUCTS & OFFERS
+// ══════════════════════════════════════════════════════
+
+model Product {
+  id           String        @id @default(cuid())
+  producerId   String
+  name         String
+  description  String?
+  type         ProductType
+  status       ProductStatus @default(PENDING)
+  imageUrl     String?
+  digitalUrl   String?
+  category     String?
+  supplierId   String?
+  sku          String?
+  weightGrams  Int?
+  isActive     Boolean       @default(true)
+  approvedAt   DateTime?
+  approvedBy   String?
+  rejectedAt   DateTime?
+  rejectedReason String?
+  metadata     Json?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  deletedAt    DateTime?
+
+  producer     Producer             @relation(fields: [producerId], references: [id])
+  offers       Offer[]
+  coproducers  CoproducerProduct[]
+
+  @@index([producerId])
+  @@index([status])
+  @@index([type])
+}
+
+model Offer {
+  id           String    @id @default(cuid())
+  productId    String
+  name         String
+  slug         String    @unique
+  description  String?
+  priceCents   Int
+  type         OfferType @default(STANDARD)
+  isActive     Boolean   @default(true)
+  metadata     Json?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  product       Product      @relation(fields: [productId], references: [id])
+  splitRules    SplitRule[]
+  orders        Order[]
+  checkoutConfig CheckoutConfig?
+
+  @@index([productId])
+  @@index([slug])
+}
+
+// ══════════════════════════════════════════════════════
+// SPLIT ENGINE — CORAÇÃO DO SISTEMA
+// ══════════════════════════════════════════════════════
+
+model SplitRule {
+  id              String        @id @default(cuid())
+  offerId         String
+  recipientType   RecipientType
+  recipientId     String?
+  basisPoints     Int           // 1% = 100 bps; 100% = 10000 bps
+  description     String?
+  isActive        Boolean       @default(true)
+  createdAt       DateTime      @default(now())
+  // IMUTÁVEL — inativar e criar novo se precisar alterar
+
+  offer         Offer         @relation(fields: [offerId], references: [id])
+  splitRecords  SplitRecord[]
+
+  @@index([offerId])
+  @@index([recipientId])
+}
+
+model SplitRecord {
+  id            String      @id @default(cuid())
+  orderId       String
+  splitRuleId   String
+  recipientType RecipientType
+  recipientId   String?
+  amountCents   Int         // IMUTÁVEL — valor real calculado
+  status        SplitStatus @default(PENDING)
+  acquirerSplitId String?
+  paidAt        DateTime?
+  failedAt      DateTime?
+  failReason    String?
+  createdAt     DateTime    @default(now())
+  // NUNCA DELETAR OU ALTERAR
+
+  order      Order      @relation(fields: [orderId], references: [id])
+  splitRule  SplitRule  @relation(fields: [splitRuleId], references: [id])
+
+  @@index([orderId])
+  @@index([recipientId])
+  @@index([status])
+}
+
+// ══════════════════════════════════════════════════════
+// ORDERS
+// ══════════════════════════════════════════════════════
+
+model Order {
+  id              String        @id @default(cuid())
+  offerId         String
+  affiliateId     String?
+  customerId      String?
+  customerEmail   String?
+  customerName    String?
+  customerDoc     String?
+  customerPhone   String?
+  amountCents     Int
+  status          OrderStatus   @default(PENDING)
+  paymentMethod   PaymentMethod?
+  acquirer        AcquirerName?
+  acquirerTxId    String?
+  cardToken       String?       // TOKEN DO ADQUIRENTE — nunca dados brutos
+  pixCode         String?
+  pixQrCode       String?
+  boletoUrl       String?
+  boletoBarcode   String?
+  installments    Int           @default(1)
+  ipAddress       String?
+  userAgent       String?
+  fingerprint     String?
+  metadata        Json?
+  approvedAt      DateTime?
+  rejectedAt      DateTime?
+  refundedAt      DateTime?
+  chargebackAt    DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  offer         Offer           @relation(fields: [offerId], references: [id])
+  affiliate     Affiliate?      @relation(fields: [affiliateId], references: [id])
+  splitRecords  SplitRecord[]
+  shipment      Shipment?
+  webhookEvents WebhookEvent[]
+
+  @@index([offerId])
+  @@index([affiliateId])
+  @@index([status])
+  @@index([acquirerTxId])
+  @@index([customerEmail])
+  @@index([createdAt])
+}
+
+// ══════════════════════════════════════════════════════
+// SUBSCRIPTIONS
+// ══════════════════════════════════════════════════════
+
+model Subscription {
+  id              String    @id @default(cuid())
+  offerId         String
+  customerId      String?
+  customerEmail   String
+  customerName    String?
+  cardToken       String?
+  acquirer        AcquirerName?
+  status          SubStatus @default(ACTIVE)
+  cycle           SubCycle
+  priceCents      Int
+  nextChargeAt    DateTime
+  retryCount      Int       @default(0)
+  lastChargedAt   DateTime?
+  lastFailAt      DateTime?
+  cancelledAt     DateTime?
+  cancelReason    String?
+  metadata        Json?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([status])
+  @@index([nextChargeAt])
+  @@index([customerEmail])
+}
+
+// ══════════════════════════════════════════════════════
+// AFFILIATES & CO-PRODUCERS
+// ══════════════════════════════════════════════════════
+
+model Affiliate {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  code        String   @unique
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user       User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trackings  AffiliateTracking[]
+  orders     Order[]
+
+  @@index([code])
+}
+
+model AffiliateTracking {
+  id           String   @id @default(cuid())
+  affiliateId  String
+  offerId      String
+  orderId      String?
+  ip           String?
+  userAgent    String?
+  clickedAt    DateTime @default(now())
+
+  affiliate Affiliate @relation(fields: [affiliateId], references: [id], onDelete: Cascade)
+
+  @@index([affiliateId])
+  @@index([offerId])
+}
+
+model Coproducer {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  user     User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  products CoproducerProduct[]
+}
+
+model CoproducerProduct {
+  id            String   @id @default(cuid())
+  coproducerId  String
+  productId     String
+  authorizedBy  String
+  authorizedAt  DateTime @default(now())
+  isActive      Boolean  @default(true)
+
+  coproducer Coproducer @relation(fields: [coproducerId], references: [id], onDelete: Cascade)
+  product    Product    @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([coproducerId, productId])
+  @@index([productId])
+}
+
+model CoproducerRequest {
+  id           String   @id @default(cuid())
+  userId       String
+  productId    String
+  message      String?
+  status       String   @default("PENDING") // PENDING | APPROVED | REJECTED
+  resolvedBy   String?
+  resolvedAt   DateTime?
+  createdAt    DateTime @default(now())
+
+  @@index([productId])
+  @@index([userId])
+}
+
+// ══════════════════════════════════════════════════════
+// CHECKOUT & LOGISTICS
+// ══════════════════════════════════════════════════════
+
+model CheckoutConfig {
+  id              String  @id @default(cuid())
+  offerId         String  @unique
+  primaryColor    String  @default("#0055FE")
+  bgColor         String  @default("#02030B")
+  logoUrl         String?
+  customDomain    String?
+  pixEnabled      Boolean @default(true)
+  cardEnabled     Boolean @default(true)
+  boletoEnabled   Boolean @default(false)
+  maxInstallments Int     @default(12)
+  passInstFee     Boolean @default(true)
+  orderBumpOfferId String?
+  upsellOfferId   String?
+  countdownMinutes Int?
+  guaranteeDays   Int?
+  facebookPixelId String?
+  gtmId           String?
+  threatMetrixEnabled Boolean @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  offer Offer @relation(fields: [offerId], references: [id])
+}
+
+model Shipment {
+  id           String     @id @default(cuid())
+  orderId      String     @unique
+  carrier      String
+  service      String?
+  trackingCode String?
+  status       ShipStatus @default(WAITING)
+  labelUrl     String?
+  estimatedAt  DateTime?
+  shippedAt    DateTime?
+  deliveredAt  DateTime?
+  returnedAt   DateTime?
+  metadata     Json?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id])
+}
+
+// ══════════════════════════════════════════════════════
+// FINANCIAL
+// ══════════════════════════════════════════════════════
+
+model Withdrawal {
+  id            String         @id @default(cuid())
+  userId        String
+  amountCents   Int
+  pixKey        String
+  pixKeyType    String
+  status        WithdrawStatus @default(PENDING)
+  acquirerTxId  String?
+  processedAt   DateTime?
+  failedAt      DateTime?
+  failReason    String?
+  metadata      Json?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
+
+model PlatformInvoice {
+  id             String   @id @default(cuid())
+  producerId     String
+  periodStart    DateTime
+  periodEnd      DateTime
+  volumeCents    Int
+  spreadBps      Int
+  amountCents    Int
+  status         String   @default("PENDING")
+  paidAt         DateTime?
+  createdAt      DateTime @default(now())
+
+  @@index([producerId])
+  @@index([status])
+}
+
+// ══════════════════════════════════════════════════════
+// WEBHOOKS
+// ══════════════════════════════════════════════════════
+
+model WebhookEndpoint {
+  id        String        @id @default(cuid())
+  userId    String
+  url       String
+  secret    String
+  events    String[]
+  status    WebhookStatus @default(ACTIVE)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  deliveries WebhookDelivery[]
+
+  @@index([userId])
+}
+
+model WebhookEvent {
+  id        String   @id @default(cuid())
+  orderId   String?
+  eventType String
+  payload   Json
+  createdAt DateTime @default(now())
+
+  order      Order?           @relation(fields: [orderId], references: [id])
+  deliveries WebhookDelivery[]
+}
+
+model WebhookDelivery {
+  id              String                @id @default(cuid())
+  endpointId      String
+  eventId         String
+  status          WebhookDeliveryStatus @default(PENDING)
+  httpStatus      Int?
+  responseBody    String?
+  attemptCount    Int                   @default(0)
+  lastAttemptAt   DateTime?
+  deliveredAt     DateTime?
+  createdAt       DateTime              @default(now())
+
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  event    WebhookEvent    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@index([endpointId])
+  @@index([status])
+}
+
+// ══════════════════════════════════════════════════════
+// AUDIT LOG
+// ══════════════════════════════════════════════════════
+
+model AuditLog {
+  id        String     @id @default(cuid())
+  userId    String?
+  ip        String?
+  userAgent String?
+  action    String
+  resource  String?
+  details   Json?
+  level     AuditLevel @default(LOW)
+  createdAt DateTime   @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([action])
+  @@index([level])
+  @@index([createdAt])
+}
+
+// ══════════════════════════════════════════════════════
+// MISC
+// ══════════════════════════════════════════════════════
+
+model PushToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  platform  String   // ios | android | web
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model FunnelGoal {
+  id          String   @id @default(cuid())
+  producerId  String
+  name        String
+  targetCents Int
+  period      String   // monthly | quarterly | annual
+  startDate   DateTime
+  endDate     DateTime
+  createdAt   DateTime @default(now())
+}
+
+model ReferralProgram {
+  id           String   @id @default(cuid())
+  referrerId   String
+  referredId   String
+  commissionBps Int
+  status       String   @default("ACTIVE")
+  createdAt    DateTime @default(now())
+
+  @@index([referrerId])
+}
