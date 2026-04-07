@@ -7,10 +7,8 @@ cmds = ["npm ci"]
 [phases.build]
 cmds = [
   "npx prisma generate",
-  "find node_modules/.prisma -type f 2>/dev/null || echo 'no .prisma files'",
-  "find node_modules/@prisma/engines -type f -name '*.node' 2>/dev/null || echo 'no engine files'",
   "npm run build || true"
 ]
 
 [start]
-cmd = "node dist/app.js"
+cmd = "npx prisma generate && node dist/app.js"
