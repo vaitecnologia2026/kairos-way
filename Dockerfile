@@ -11,16 +11,13 @@ RUN npm ci --only=production && npm cache clean --force
 # Build
 FROM base AS builder
 COPY package*.json tsconfig.json ./
-# Instalar dependências e fixar versão do Prisma ANTES de qualquer coisa
 RUN npm ci
 RUN npm install --save-exact prisma@5.22.0 @prisma/client@5.22.0
 COPY src ./src
 COPY prisma ./prisma
-RUN ./node_modules/.bin/prisma generate --schema=./prisma/schema.prisma
-# Build ignorando erros de tipo
+RUN npx prisma@5.22.0 generate --schema=./prisma/schema.prisma
 RUN npm run build || true
-# Garantir que dist foi gerado
-RUN ls dist/app.js
+RUN ls dist/app.js && echo "Build OK"
 
 # Produção
 FROM base AS runner
