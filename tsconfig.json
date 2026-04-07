@@ -1,22 +1,20 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "module": "CommonJS",
-    "lib": ["ES2022"],
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
+    "target"          : "ES2020",
+    "module"          : "CommonJS",
+    "lib"             : ["ES2020"],
+    "outDir"          : "./dist",
+    "rootDir"         : "./src",
+    "strict"          : false,
+    "skipLibCheck"    : true,
+    "esModuleInterop" : true,
     "resolveJsonModule": true,
-    "declaration": true,
-    "declarationMap": true,
-    "sourceMap": true,
-    "paths": {
-      "@/*": ["./src/*"]
-    },
-    "baseUrl": "."
+    "declaration"     : false,
+    "noEmitOnError"   : false,
+    "noUnusedLocals"  : false,
+    "noUnusedParameters": false,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
