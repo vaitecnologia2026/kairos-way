@@ -12,9 +12,11 @@ RUN npm ci --only=production && npm cache clean --force
 FROM base AS builder
 COPY package*.json tsconfig.json ./
 RUN npm ci
+# Forçar versão correta do prisma e client
+RUN npm install prisma@5.22.0 @prisma/client@5.22.0 --save-exact
 COPY src ./src
 COPY prisma ./prisma
-RUN npx prisma@5.22.0 generate
+RUN node_modules/.bin/prisma generate
 RUN npm run build
 
 # Produção
@@ -23,8 +25,10 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 COPY --from=deps    /app/node_modules          ./node_modules
-COPY --from=builder /app/dist                  ./dist
+# Sobrescrever com os node_modules do builder que têm o prisma correto
 COPY --from=builder /app/node_modules/.prisma  ./node_modules/.prisma
+COPY --from=builder /app/node_modules/@prisma  ./node_modules/@prisma
+COPY --from=builder /app/dist                  ./dist
 COPY --from=builder /app/prisma                ./prisma
 
 EXPOSE 3333
