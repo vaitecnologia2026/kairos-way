@@ -8,9 +8,6 @@ const audit = new AuditService();
 
 import { whatsAppService } from '../../shared/services/whatsapp.service';
 import { Resend } from 'resend';
-import { SplitEngineService } from '../gateway/split-engine.service';
-
-const splitEngine = new SplitEngineService();
 
 export async function adminRoutes(app: FastifyInstance) {
 
@@ -160,11 +157,30 @@ export async function adminRoutes(app: FastifyInstance) {
     try {
       const existingSplits = await prisma.splitRecord.count({ where: { orderId } });
       if (existingSplits === 0 && order.offerId) {
-        const splits = await splitEngine.calculate(order.offerId, order.amountCents);
-        await splitEngine.saveSplitRecords(orderId, splits);
+        const rules = await prisma.splitRule.findMany({
+          where: { offerId: order.offerId, isActive: true },
+          orderBy: { createdAt: 'asc' },
+        });
+        if (rules.length > 0) {
+          let allocated = 0;
+          const splitData = rules.map((rule: any, i: number) => {
+            const amount = i === rules.length - 1
+              ? order.amountCents - allocated
+              : Math.floor(order.amountCents * rule.basisPoints / 10000);
+            allocated += amount;
+            return {
+              orderId,
+              splitRuleId : rule.id,
+              recipientType: rule.recipientType,
+              recipientId : rule.recipientId,
+              amountCents : amount,
+              status      : 'PENDING' as const,
+            };
+          });
+          await prisma.splitRecord.createMany({ data: splitData });
+        }
       }
     } catch (splitErr: any) {
-      // Não bloqueia o approve se não tiver split configurado
       console.warn('Split não gerado:', splitErr.message);
     }
 
