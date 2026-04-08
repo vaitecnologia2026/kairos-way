@@ -8,6 +8,9 @@ const audit = new AuditService();
 
 import { whatsAppService } from '../../shared/services/whatsapp.service';
 import { Resend } from 'resend';
+import { SplitEngineService } from '../gateway/split-engine.service';
+
+const splitEngine = new SplitEngineService();
 
 export async function adminRoutes(app: FastifyInstance) {
 
@@ -152,6 +155,18 @@ export async function adminRoutes(app: FastifyInstance) {
       where: { id: orderId },
       data : { status: 'APPROVED', approvedAt: new Date() },
     });
+
+    // 1b. Criar SplitRecords se ainda não existirem
+    try {
+      const existingSplits = await prisma.splitRecord.count({ where: { orderId } });
+      if (existingSplits === 0 && order.offerId) {
+        const splits = await splitEngine.calculate(order.offerId, order.amountCents);
+        await splitEngine.saveSplitRecords(orderId, splits);
+      }
+    } catch (splitErr: any) {
+      // Não bloqueia o approve se não tiver split configurado
+      console.warn('Split não gerado:', splitErr.message);
+    }
 
     const digitalUrl  = (order.offer?.product as any)?.digitalUrl;
     const productName = order.offer?.product?.name || 'Produto';
