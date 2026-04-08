@@ -41,7 +41,7 @@ const app = Fastify({
 async function bootstrap() {
   // ── PLUGINS ──────────────────────────────────────────────────
   await app.register(cors, {
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    origin: process.env.FRONTEND_URL || 'https://kairos-front-sage.vercel.app',
     credentials: true,
   });
 
