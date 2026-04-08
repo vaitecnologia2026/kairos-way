@@ -119,7 +119,7 @@ export async function financialRoutes(app: FastifyInstance) {
     // Marcar como PAID
     await prisma.withdrawal.update({
       where: { id },
-      data : { status: 'PAID', processedAt: new Date() },
+      data : { status: 'PAID', paidAt: new Date() },
     });
 
     await audit.log({
@@ -251,21 +251,30 @@ export async function financialRoutes(app: FastifyInstance) {
     return reply.send(balances);
   });
 
-  // POST /financial/repasse-auto — executar repasses automáticos
+  // POST /financial/repasse-auto — marca splits PENDING como PAID
   app.post('/repasse-auto', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
-    const pending = await prisma.withdrawal.findMany({
-      where: { status: 'PENDING' },
-      take: 50,
+    // Buscar todos os splits pendentes de pedidos APPROVED
+    const pending = await prisma.splitRecord.findMany({
+      where : { status: 'PENDING', order: { status: 'APPROVED' } },
+      select: { id: true },
+      take  : 100,
+    });
+
+    if (pending.length === 0) {
+      return reply.send({ message: 'Nenhum split pendente encontrado.', processed: 0 });
+    }
+
+    // Marcar todos como PAID
+    const result = await prisma.splitRecord.updateMany({
+      where: { id: { in: pending.map(p => p.id) }, status: 'PENDING' },
+      data : { status: 'PAID', paidAt: new Date() },
     });
 
     await audit.log({
-      userId: req.user.sub, action: 'REPASSE_AUTO_TRIGGERED',
-      details: { count: pending.length }, level: 'HIGH',
+      userId : req.user.sub, action: 'REPASSE_AUTO_TRIGGERED',
+      details: { count: result.count }, level: 'HIGH',
     });
 
-    // Adicionar à fila de repasses
-    // repasesQueue.add('process', { withdrawalIds: pending.map(w => w.id) });
-
-    return reply.send({ message: `${pending.length} repasse(s) enfileirado(s)` });
+    return reply.send({ message: `${result.count} repasse(s) processado(s) com sucesso!`, processed: result.count });
   });
 }
