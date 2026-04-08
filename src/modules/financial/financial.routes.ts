@@ -19,6 +19,16 @@ export async function financialRoutes(app: FastifyInstance) {
     return reply.send(balance);
   });
 
+  // GET /financial/splits/pending-admin — admin vê todos os splits pendentes
+  app.get('/splits/pending-admin', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
+    const splits = await prisma.splitRecord.findMany({
+      where  : { status: 'PENDING' },
+      orderBy: { createdAt: 'desc' },
+      take   : 100,
+    });
+    return reply.send(splits);
+  });
+
   // GET /financial/splits — histórico de splits recebidos
   app.get('/splits', { preHandler: [authenticate] }, async (req, reply) => {
     const { page = '1', limit = '50', status } = req.query as any;
