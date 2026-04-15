@@ -1,252 +1,476 @@
-import { FastifyInstance } from 'fastify';
-import { z } from 'zod';
-import { parse } from 'csv-parse/sync';
-import crypto from 'crypto';
-import { authenticate, requireRole } from '../../shared/middleware/auth.middleware';
-import { prisma } from '../../shared/utils/prisma';
-import { NotFoundError, AppError } from '../../shared/errors/AppError';
-import { nanoid } from 'nanoid';
+import { FastifyInstance }                          from 'fastify';
+import { z }                                         from 'zod';
+import { authenticate, requireRole }                 from '../../shared/middleware/auth.middleware';
+import { prisma }                                    from '../../shared/utils/prisma';
+import { AuditService }                              from '../audit/audit.service';
+import { createId }                                  from '@paralleldrive/cuid2';
+import bcrypt                                          from 'bcryptjs';
 
-// FIX B-07: hash impossível para contas sem senha (não pode ser reversed)
-// Usa 64 bytes aleatórios — bcrypt.compare sempre retorna false
-const IMPOSSIBLE_HASH = `*NOLOGIN_${crypto.randomBytes(32).toString('hex')}`;
+const audit = new AuditService();
 
-export async function affiliateRoutes(app: FastifyInstance) {
+export async function affiliatesRoutes(app: FastifyInstance) {
 
-  // ── POST /affiliates — criar afiliado individual ──────────────
-  app.post('/', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
-  }, async (req, reply) => {
+  // ─── REGISTRO PÚBLICO ────────────────────────────────────────────────────
+
+  // POST /affiliates/register — cadastro público de afiliado
+  app.post('/register', async (req, reply) => {
     const body = z.object({
-      name     : z.string().min(3),
-      email    : z.string().email(),
-      document : z.string().optional(),
-      phone    : z.string().optional(),
+      name    : z.string().min(2),
+      email   : z.string().email(),
+      password: z.string().min(6),
+      phone   : z.string().optional(),
+      document: z.string().optional(),
     }).parse(req.body);
 
-    // Verificar limite de 1000 usando transação atômica
-    // FIX B-05: usa $transaction para evitar race condition
-    const result = await prisma.$transaction(async (tx) => {
-      const count = await tx.affiliate.count({ where: { isActive: true } });
-      if (count >= 1000) throw new AppError('Limite de 1.000 afiliados atingido', 409);
+    const existing = await prisma.user.findUnique({ where: { email: body.email } });
+    if (existing) return reply.status(409).send({ message: 'E-mail já cadastrado.' });
 
-      const existing = await tx.user.findUnique({ where: { email: body.email } });
-      if (existing) throw new AppError('Email já cadastrado', 409);
+    const passwordHash = await bcrypt.hash(body.password, 12);
 
-      const code = nanoid(10);
-
-      const user = await tx.user.create({
-        data: {
-          name        : body.name,
-          email       : body.email,
-          // FIX B-07: hash impossível — afiliado não pode fazer login com senha
-          passwordHash: IMPOSSIBLE_HASH,
-          role        : 'AFFILIATE',
-          isActive    : true,
-          document    : body.document,
-          phone       : body.phone,
-          affiliate   : { create: { code } },
-        },
-      });
-
-      return { userId: user.id, code };
+    const user = await prisma.user.create({
+      data: {
+        name    : body.name,
+        email   : body.email,
+        passwordHash,
+        role    : 'AFFILIATE',
+        phone   : body.phone,
+        document: body.document,
+        isActive: false, // inativo até aprovação
+      },
     });
 
-    const link = `${process.env.FRONTEND_URL}/checkout?aff=${result.code}`;
-    return reply.status(201).send({ ...result, link });
+    // Criar perfil de afiliado com status PENDING
+    await prisma.affiliate.create({
+      data: {
+        userId  : user.id,
+        code    : createId().slice(0, 8).toUpperCase(),
+        isActive: false,
+        status  : 'PENDING',
+      },
+    });
+
+    return reply.status(201).send({
+      message: 'Cadastro realizado! Aguarde a aprovação do produtor para acessar a plataforma.',
+    });
   });
 
-  // ── POST /affiliates/bulk — importar CSV ──────────────────────
-  // FIX B-06: processamento em lotes com createMany (não sequencial)
-  app.post('/bulk', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
-  }, async (req, reply) => {
-    const data = await req.file();
-    if (!data) throw new AppError('Arquivo CSV obrigatório');
+  // ─── ROTAS DO PRODUTOR ────────────────────────────────────────────────────
 
-    const buf     = await data.toBuffer();
-    const records = parse(buf, { columns: true, skip_empty_lines: true, trim: true }) as any[];
+  // GET /affiliates/offers — ofertas do produtor com config de afiliação
+  app.get('/offers', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+    if (!producer && req.user.role !== 'ADMIN') return reply.send([]);
 
-    if (records.length === 0) throw new AppError('CSV vazio ou sem registros válidos');
-    if (records.length > 1000) throw new AppError('CSV não pode ter mais de 1.000 registros');
+    const where = req.user.role === 'ADMIN' ? {} : {
+      product: { producerId: producer!.id },
+    };
 
-    const count = await prisma.affiliate.count({ where: { isActive: true } });
-    const slots = 1000 - count;
-    if (slots <= 0) throw new AppError('Limite de 1.000 afiliados atingido', 409);
-
-    const toProcess = records.slice(0, slots);
-
-    // Buscar emails já existentes em uma única query
-    const emails       = toProcess.map((r: any) => r.email).filter(Boolean);
-    const existingUsers = await prisma.user.findMany({
-      where : { email: { in: emails } },
-      select: { email: true },
+    const offers = await prisma.offer.findMany({
+      where,
+      include: {
+        product            : { select: { name: true, imageUrl: true } },
+        affiliateConfig    : true,
+        _count             : { select: { affiliateEnrollments: true } },
+      },
+      orderBy: { createdAt: 'desc' },
     });
-    const existingEmails = new Set(existingUsers.map((u) => u.email));
 
-    const created : string[] = [];
-    const errors  : { row: number; email: string; error: string }[] = [];
+    return reply.send(offers);
+  });
 
-    // Preparar lote de usuários válidos
-    const validRecords = toProcess
-      .map((r: any, i: number) => {
-        if (!r.email || !r.name) {
-          errors.push({ row: i + 1, email: r.email || '—', error: 'email e name são obrigatórios' });
-          return null;
-        }
-        if (existingEmails.has(r.email)) {
-          errors.push({ row: i + 1, email: r.email, error: 'Email já cadastrado' });
-          return null;
-        }
-        return { name: r.name, email: r.email, code: nanoid(10) };
-      })
-      .filter(Boolean) as { name: string; email: string; code: string }[];
+  // POST /affiliates/offers/:offerId/config — habilitar/configurar afiliação
+  app.post('/offers/:offerId/config', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+    const { offerId } = req.params as { offerId: string };
+    const body = z.object({
+      enabled      : z.boolean(),
+      commissionBps: z.number().int().min(100).max(5000), // 1% a 50%
+      cookieDays   : z.number().int().min(1).max(90).default(30),
+      description  : z.string().max(200).optional(),
+    }).parse(req.body);
 
-    // Criar todos em uma transação com createMany (uma query por lote)
-    if (validRecords.length > 0) {
-      await prisma.$transaction(async (tx) => {
-        // Criar usuários
-        await tx.user.createMany({
-          data: validRecords.map((r) => ({
-            name        : r.name,
-            email       : r.email,
-            passwordHash: IMPOSSIBLE_HASH, // FIX B-07
-            role        : 'AFFILIATE',
-            isActive    : true,
-          })),
-          skipDuplicates: true,
-        });
+    const offer = await prisma.offer.findUnique({
+      where  : { id: offerId },
+      include: { product: { select: { producerId: true } } },
+    });
 
-        // Buscar IDs dos usuários criados
-        const createdUsers = await tx.user.findMany({
-          where : { email: { in: validRecords.map((r) => r.email) } },
-          select: { id: true, email: true },
-        });
+    if (!offer) return reply.status(404).send({ message: 'Oferta não encontrada' });
 
-        const emailToId = new Map(createdUsers.map((u) => [u.email, u.id]));
-
-        // Criar afiliados com códigos únicos
-        await tx.affiliate.createMany({
-          data: validRecords
-            .map((r) => ({
-              userId  : emailToId.get(r.email)!,
-              code    : r.code,
-              isActive: true,
-            }))
-            .filter((a) => a.userId),
-          skipDuplicates: true,
-        });
-      });
-
-      validRecords.forEach((r) => created.push(r.email));
+    if (req.user.role !== 'ADMIN') {
+      const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+      if (!producer || offer.product.producerId !== producer.id) {
+        return reply.status(403).send({ message: 'Sem permissão' });
+      }
     }
 
+    const config = await prisma.affiliateConfig.upsert({
+      where : { offerId },
+      create: { offerId, ...body },
+      update: body,
+    });
+
+    return reply.send(config);
+  });
+
+  // GET /affiliates/offers/:offerId/enrollments — afiliados inscritos
+  app.get('/offers/:offerId/enrollments', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+    const { offerId } = req.params as { offerId: string };
+
+    const enrollments = await prisma.affiliateEnrollment.findMany({
+      where  : { offerId },
+      include: {
+        affiliate: { include: { user: { select: { name: true, email: true } } } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return reply.send(enrollments);
+  });
+
+  // GET /affiliates/pending — afiliados (filtra por status)
+  app.get('/pending', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { status } = req.query as { status?: string };
+    const affiliates = await prisma.affiliate.findMany({
+      where  : status ? { status } : {},
+      include: { user: { select: { id: true, name: true, email: true, phone: true, document: true, createdAt: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+    return reply.send(affiliates);
+  });
+
+  // POST /affiliates/:id/approve — produtor/admin aprova afiliado
+  app.post('/:id/approve', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+
+    const affiliate = await prisma.affiliate.findUnique({
+      where  : { id },
+      include: { user: true },
+    });
+    if (!affiliate) return reply.status(404).send({ message: 'Afiliado não encontrado' });
+
+    // Ativar usuário e afiliado
+    await prisma.$transaction([
+      prisma.affiliate.update({
+        where: { id },
+        data : { status: 'APPROVED', isActive: true, approvedBy: req.user.sub, approvedAt: new Date() },
+      }),
+      prisma.user.update({
+        where: { id: affiliate.userId },
+        data : { isActive: true },
+      }),
+    ]);
+
+    await audit.log({
+      userId : req.user.sub, action: 'AFFILIATE_APPROVED',
+      details: { affiliateId: id, affiliateEmail: affiliate.user.email }, level: 'MEDIUM',
+    });
+
+    return reply.send({ message: 'Afiliado aprovado com sucesso!' });
+  });
+
+  // POST /affiliates/:id/reject — produtor/admin rejeita afiliado
+  app.post('/:id/reject', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const { reason } = z.object({ reason: z.string().optional() }).parse(req.body);
+
+    await prisma.affiliate.update({
+      where: { id },
+      data : {
+        status        : 'REJECTED',
+        rejectedBy    : req.user.sub,
+        rejectedAt    : new Date(),
+        rejectedReason: reason,
+      },
+    });
+
+    await audit.log({
+      userId : req.user.sub, action: 'AFFILIATE_REJECTED',
+      details: { affiliateId: id, reason }, level: 'MEDIUM',
+    });
+
+    return reply.send({ message: 'Afiliado rejeitado.' });
+  });
+
+  // ─── ROTAS DO AFILIADO ────────────────────────────────────────────────────
+
+  // GET /affiliates/marketplace — ofertas disponíveis para afiliar
+  app.get('/marketplace', { preHandler: [authenticate] }, async (req, reply) => {
+    const configs = await prisma.affiliateConfig.findMany({
+      where  : { enabled: true },
+      include: {
+        offer: {
+          include: {
+            product: { select: { name: true, imageUrl: true, type: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    // Buscar inscrições do afiliado atual (se existir)
+    const affiliate = await prisma.affiliate.findUnique({ where: { userId: req.user.sub } });
+    const myEnrollments = affiliate
+      ? await prisma.affiliateEnrollment.findMany({
+          where : { affiliateId: affiliate.id },
+          select: { offerId: true, status: true },
+        })
+      : [];
+
+    const myOfferMap = new Map(myEnrollments.map(e => [e.offerId, e.status]));
+
+    return reply.send(configs.map(c => ({
+      offerId      : c.offerId,
+      offerName    : c.offer.name,
+      productName  : c.offer.product.name,
+      productImage : c.offer.product.imageUrl,
+      commissionBps: c.commissionBps,
+      commissionPct: c.commissionBps / 100,
+      cookieDays   : c.cookieDays,
+      description  : c.description,
+      myStatus     : myOfferMap.get(c.offerId) || null,
+    })));
+  });
+
+  // POST /affiliates/enroll — se inscrever em uma oferta
+  app.post('/enroll', { preHandler: [authenticate] }, async (req, reply) => {
+    const { offerId } = z.object({ offerId: z.string() }).parse(req.body);
+
+    const config = await prisma.affiliateConfig.findUnique({ where: { offerId, enabled: true } });
+    if (!config) return reply.status(404).send({ message: 'Oferta não disponível para afiliação' });
+
+    // Criar perfil de afiliado se não existir
+    let affiliate = await prisma.affiliate.findUnique({ where: { userId: req.user.sub } });
+    if (!affiliate) {
+      affiliate = await prisma.affiliate.create({
+        data: {
+          userId: req.user.sub,
+          code  : createId().slice(0, 8).toUpperCase(),
+        },
+      });
+    }
+
+    // Verificar se já inscrito
+    const existing = await prisma.affiliateEnrollment.findUnique({
+      where: { affiliateId_offerId: { affiliateId: affiliate.id, offerId } },
+    });
+    if (existing) return reply.send(existing);
+
+    const enrollment = await prisma.affiliateEnrollment.create({
+      data: {
+        affiliateId: affiliate.id,
+        offerId,
+        status     : 'ACTIVE',
+        link       : `${process.env.FRONTEND_URL}/checkout/${(await prisma.offer.findUnique({ where: { id: offerId }, select: { slug: true } }))?.slug}?ref=${affiliate.code}`,
+      },
+    });
+
+    return reply.status(201).send(enrollment);
+  });
+
+  // GET /affiliates/my-enrollments — minhas inscrições e links
+  app.get('/my-enrollments', { preHandler: [authenticate] }, async (req, reply) => {
+    const affiliate = await prisma.affiliate.findUnique({ where: { userId: req.user.sub } });
+    if (!affiliate) return reply.send([]);
+
+    const enrollments = await prisma.affiliateEnrollment.findMany({
+      where  : { affiliateId: affiliate.id },
+      include: {
+        offer: {
+          include: {
+            product      : { select: { name: true, imageUrl: true } },
+            affiliateConfig: { select: { commissionBps: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    // Para cada inscrição, buscar estatísticas
+    const result = await Promise.all(enrollments.map(async (e) => {
+      const [clicks, conversions, revenue] = await Promise.all([
+        prisma.affiliateTracking.count({ where: { affiliateId: affiliate.id, offerId: e.offerId } }),
+        prisma.affiliateTracking.count({ where: { affiliateId: affiliate.id, offerId: e.offerId, orderId: { not: null } } }),
+        prisma.splitRecord.aggregate({
+          where: { recipientId: req.user.sub, recipientType: 'AFFILIATE', order: { offerId: e.offerId } },
+          _sum : { amountCents: true },
+        }),
+      ]);
+
+      return {
+        id           : e.id,
+        offerId      : e.offerId,
+        offerName    : e.offer.name,
+        productName  : e.offer.product.name,
+        productImage : e.offer.product.imageUrl,
+        commissionBps: e.offer.affiliateConfig?.commissionBps || 0,
+        link         : e.link,
+        status       : e.status,
+        clicks,
+        conversions,
+        revenueCents : revenue._sum.amountCents || 0,
+        createdAt    : e.createdAt,
+      };
+    }));
+
+    return reply.send(result);
+  });
+
+  // GET /affiliates/my-stats — resumo financeiro do afiliado
+  // Query param: filter = 'all' | 'own' | 'affiliate' (default: 'all')
+  app.get('/my-stats', { preHandler: [authenticate] }, async (req, reply) => {
+    const { filter = 'all' } = req.query as { filter?: string };
+
+    // Buscar producer record e flag canCreateProducts
+    const [producer, affiliateRec] = await Promise.all([
+      prisma.producer.findUnique({ where: { userId: req.user.sub } }),
+      prisma.affiliate.findUnique({ where: { userId: req.user.sub }, select: { canCreateProducts: true } }),
+    ]);
+
+    // Montar condições de pedidos por filtro
+    const orderWhereAffiliate = { affiliate: { userId: req.user.sub }, status: 'APPROVED' as const };
+    const orderWhereOwn       = producer
+      ? { offer: { product: { producerId: producer.id } }, status: 'APPROVED' as const, affiliateId: null }
+      : null;
+
+    const orderWhere =
+      filter === 'affiliate' ? orderWhereAffiliate :
+      filter === 'own'       ? (orderWhereOwn ?? { id: 'none' }) :
+      // 'all' — afiliações + produtos próprios
+      producer
+        ? { status: 'APPROVED' as const, OR: [
+            { affiliate: { userId: req.user.sub } },
+            { offer: { product: { producerId: producer.id } } },
+          ]}
+        : orderWhereAffiliate;
+
+    const [available, pending, totalClicks, totalConversions, volume] = await Promise.all([
+      prisma.splitRecord.aggregate({
+        where: { recipientId: req.user.sub, recipientType: { in: ['AFFILIATE', 'PRODUCER'] }, status: 'PAID' },
+        _sum : { amountCents: true },
+      }),
+      prisma.splitRecord.aggregate({
+        where: { recipientId: req.user.sub, recipientType: { in: ['AFFILIATE', 'PRODUCER'] }, status: 'PENDING' },
+        _sum : { amountCents: true },
+      }),
+      prisma.affiliateTracking.count({
+        where: { affiliate: { userId: req.user.sub } },
+      }),
+      prisma.order.count({ where: orderWhere }),
+      prisma.order.aggregate({
+        where: orderWhere,
+        _sum : { amountCents: true },
+      }),
+    ]);
+
+    const withdrawn = await prisma.withdrawal.aggregate({
+      where: { userId: req.user.sub, status: { in: ['PAID', 'PROCESSING'] } },
+      _sum : { amountCents: true },
+    });
+
+    const paidCents      = available._sum.amountCents || 0;
+    const withdrawnCents = withdrawn._sum.amountCents || 0;
+    const volumeCents    = volume._sum.amountCents    || 0;
+
+    const TIERS = [
+      { name: 'Bronze',   min: 0,        max: 2000000,  next: 2000000  },
+      { name: 'Prata',    min: 2000000,  max: 5000000,  next: 5000000  },
+      { name: 'Ouro',     min: 5000000,  max: 10000000, next: 10000000 },
+      { name: 'Diamante', min: 10000000, max: Infinity, next: null     },
+    ];
+
+    const currentTier = [...TIERS].reverse().find(t => volumeCents >= t.min) || TIERS[0];
+    const nextGoal    = currentTier.next;
+    const tierProgress = nextGoal
+      ? Math.min(100, Math.round(((volumeCents - currentTier.min) / (nextGoal - currentTier.min)) * 100))
+      : 100;
+
     return reply.send({
-      created : created.length,
-      errors  : errors.length,
-      skipped : records.length - toProcess.length,
-      details : errors,
+      availableCents    : Math.max(0, paidCents - withdrawnCents),
+      pendingCents      : pending._sum.amountCents || 0,
+      totalClicks,
+      totalConversions,
+      conversionRate    : totalClicks > 0 ? ((totalConversions / totalClicks) * 100).toFixed(1) : '0.0',
+      volumeCents,
+      totalSales        : totalConversions,
+      tier              : currentTier.name,
+      tierProgress,
+      tierNextGoal      : nextGoal,
+      canCreateProducts : affiliateRec?.canCreateProducts || false,
     });
   });
 
-  // ── GET /affiliates — listar afiliados ────────────────────────
-  app.get('/', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
-  }, async (req, reply) => {
-    const { page = '1', limit = '50', search } = req.query as any;
-    const skip = (Number(page) - 1) * Number(limit);
+  // GET /affiliates/my-chart — receita diária dos últimos 14 dias
+  // Query param: filter = 'all' | 'own' | 'affiliate' (default: 'all')
+  app.get('/my-chart', { preHandler: [authenticate] }, async (req, reply) => {
+    const { filter = 'all' } = req.query as { filter?: string };
 
-    const where: any = {};
-    if (search) {
-      where.user = {
-        OR: [
-          { name  : { contains: search, mode: 'insensitive' } },
-          { email : { contains: search, mode: 'insensitive' } },
-        ],
+    const since = new Date();
+    since.setDate(since.getDate() - 13);
+    since.setHours(0, 0, 0, 0);
+
+    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+
+    const orderWhereAffiliate = { affiliate: { userId: req.user.sub }, status: 'APPROVED' as const, createdAt: { gte: since } };
+    const orderWhereOwn       = producer
+      ? { offer: { product: { producerId: producer.id } }, status: 'APPROVED' as const, createdAt: { gte: since }, affiliateId: null }
+      : null;
+
+    const orderWhere =
+      filter === 'affiliate' ? orderWhereAffiliate :
+      filter === 'own'       ? (orderWhereOwn ?? { id: 'none' }) :
+      producer
+        ? { status: 'APPROVED' as const, createdAt: { gte: since }, OR: [
+            { affiliate: { userId: req.user.sub } },
+            { offer: { product: { producerId: producer.id } } },
+          ]}
+        : orderWhereAffiliate;
+
+    const orders = await prisma.order.findMany({
+      where : orderWhere,
+      select: { amountCents: true, createdAt: true },
+    });
+
+    const days: Record<string, { day: string; receita: number; pedidos: number }> = {};
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const key = d.toISOString().slice(0, 10);
+      days[key] = {
+        day    : d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }),
+        receita: 0,
+        pedidos: 0,
       };
     }
 
-    const [data, total] = await Promise.all([
-      prisma.affiliate.findMany({
-        where,
-        include: { user: { select: { name: true, email: true, phone: true } } },
-        skip, take: Number(limit), orderBy: { createdAt: 'desc' },
-      }),
-      prisma.affiliate.count({ where }),
-    ]);
+    orders.forEach((o: any) => {
+      const key = new Date(o.createdAt).toISOString().slice(0, 10);
+      if (days[key]) {
+        days[key].receita += o.amountCents;
+        days[key].pedidos += 1;
+      }
+    });
 
-    return reply.send({ data, total, page: Number(page), limit: Number(limit) });
+    return reply.send(Object.values(days));
   });
 
-  // ── GET /affiliates/:code/track — rastrear clique ─────────────
-  app.get('/:code/track', async (req, reply) => {
-    const { code    } = req.params as { code: string };
-    const { offerId } = req.query  as { offerId?: string };
+  // POST /affiliates/track — registrar clique (chamado pelo checkout)
+  app.post('/track', async (req, reply) => {
+    const { affiliateCode, offerId } = z.object({
+      affiliateCode: z.string(),
+      offerId      : z.string(),
+    }).parse(req.body);
 
-    const affiliate = await prisma.affiliate.findUnique({
-      where: { code, isActive: true },
+    const affiliate = await prisma.affiliate.findUnique({ where: { code: affiliateCode } });
+    if (!affiliate) return reply.status(404).send({ message: 'Afiliado não encontrado' });
+
+    await prisma.affiliateTracking.create({
+      data: {
+        affiliateId: affiliate.id,
+        offerId,
+        ip        : req.ip,
+        userAgent : req.headers['user-agent'] || '',
+      },
     });
 
-    if (!affiliate) return reply.status(404).send({ error: 'Link inválido' });
-
-    if (offerId) {
-      // Fire-and-forget — não bloqueia a resposta
-      prisma.affiliateTracking.create({
-        data: {
-          affiliateId : affiliate.id,
-          offerId,
-          ip          : req.ip,
-          userAgent   : req.headers['user-agent'],
-        },
-      }).catch(() => {}); // não quebra o fluxo se falhar
-    }
-
-    return reply.send({ affiliateId: affiliate.id, code });
-  });
-
-  // ── GET /affiliates/dashboard — painel do afiliado ────────────
-  app.get('/dashboard', {
-    preHandler: [authenticate, requireRole('AFFILIATE')],
-  }, async (req, reply) => {
-    const affiliate = await prisma.affiliate.findUnique({
-      where: { userId: req.user.sub },
-    });
-    if (!affiliate) throw new NotFoundError('Afiliado');
-
-    const [totalClicks, earningsAgg, paidEarningsAgg] = await Promise.all([
-      prisma.affiliateTracking.count({ where: { affiliateId: affiliate.id } }),
-      prisma.splitRecord.aggregate({
-        where: { recipientId: req.user.sub, status: 'PENDING' },
-        _sum : { amountCents: true },
-      }),
-      prisma.splitRecord.aggregate({
-        where: { recipientId: req.user.sub, status: 'PAID' },
-        _sum : { amountCents: true },
-      }),
-    ]);
-
-    return reply.send({
-      code              : affiliate.code,
-      link              : `${process.env.FRONTEND_URL}/checkout?aff=${affiliate.code}`,
-      totalClicks,
-      pendingEarnings   : earningsAgg._sum.amountCents     || 0,
-      paidEarnings      : paidEarningsAgg._sum.amountCents || 0,
-      totalEarningsCents: (earningsAgg._sum.amountCents || 0) + (paidEarningsAgg._sum.amountCents || 0),
-    });
-  });
-
-  // ── PATCH /affiliates/:id — ativar/desativar ──────────────────
-  app.patch('/:id', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
-  }, async (req, reply) => {
-    const { id   } = req.params as { id: string };
-    const body     = z.object({ isActive: z.boolean() }).parse(req.body);
-
-    const affiliate = await prisma.affiliate.update({
-      where: { id },
-      data : { isActive: body.isActive },
-    });
-
-    return reply.send(affiliate);
+    return reply.send({ ok: true });
   });
 }

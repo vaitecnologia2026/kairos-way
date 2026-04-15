@@ -18,7 +18,9 @@ import { productRoutes } from './modules/products/products.routes';
 import { offerRoutes } from './modules/offers/offers.routes';
 import { gatewayRoutes } from './modules/gateway/gateway.routes';
 import { checkoutRoutes } from './modules/checkout/checkout.routes';
-import { affiliateRoutes } from './modules/affiliates/affiliates.routes';
+import { affiliatesRoutes } from './modules/affiliates/affiliates.routes';
+import { coproducerRequestRoutes } from './modules/coproducers/coproducer-requests.routes';
+
 import { coproducerRoutes } from './modules/coproducers/coproducers.routes';
 import { subscriptionRoutes } from './modules/subscriptions/subscriptions.routes';
 import { logisticsRoutes } from './modules/logistics/logistics.routes';
@@ -41,7 +43,7 @@ const app = Fastify({
 async function bootstrap() {
   // ── PLUGINS ──────────────────────────────────────────────────
   await app.register(cors, {
-    origin: process.env.FRONTEND_URL || 'https://kairos-front-sage.vercel.app',
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
     credentials: true,
   });
 
@@ -111,7 +113,8 @@ async function bootstrap() {
   await app.register(offerRoutes,        { prefix: '/offers' });
   await app.register(gatewayRoutes,      { prefix: '/gateway' });
   await app.register(checkoutRoutes,     { prefix: '/checkout' });
-  await app.register(affiliateRoutes,    { prefix: '/affiliates' });
+  await app.register(affiliatesRoutes,    { prefix: '/affiliates' });
+  await app.register(coproducerRequestRoutes, { prefix: '/coproducer-requests' });
   await app.register(coproducerRoutes,   { prefix: '/coproducers' });
   await app.register(subscriptionRoutes, { prefix: '/subscriptions' });
   await app.register(logisticsRoutes,    { prefix: '/logistics' });

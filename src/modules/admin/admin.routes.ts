@@ -142,7 +142,7 @@ export async function adminRoutes(app: FastifyInstance) {
 
     const order = await prisma.order.findUnique({
       where  : { id: orderId },
-      include: { offer: { include: { product: true } } },
+      include: { offer: { include: { product: { include: { producer: true } } } } },
     });
 
     if (!order) throw new NotFoundError('Pedido');
@@ -162,22 +162,61 @@ export async function adminRoutes(app: FastifyInstance) {
           orderBy: { createdAt: 'asc' },
         });
         if (rules.length > 0) {
+          // Buscar userId do produtor para resolver recipientId automaticamente
+          const producerUserId = order.offer?.product?.producer?.userId || null;
           let allocated = 0;
           const splitData = rules.map((rule: any, i: number) => {
             const amount = i === rules.length - 1
               ? order.amountCents - allocated
               : Math.floor(order.amountCents * rule.basisPoints / 10000);
             allocated += amount;
+            const recipientId = rule.recipientId
+              ? rule.recipientId
+              : rule.recipientType === 'PRODUCER'
+                ? producerUserId
+                : null;
             return {
               orderId,
-              splitRuleId : rule.id,
+              splitRuleId  : rule.id,
               recipientType: rule.recipientType,
-              recipientId : rule.recipientId,
-              amountCents : amount,
-              status      : 'PENDING' as const,
+              recipientId,
+              amountCents  : amount,
+              status       : 'PENDING' as const,
             };
           });
           await prisma.splitRecord.createMany({ data: splitData });
+        }
+      }
+      // Split do afiliado
+      if (order.affiliateId) {
+        const affiliate = await prisma.affiliate.findUnique({ where: { id: order.affiliateId } });
+        if (affiliate) {
+          const config = await prisma.affiliateConfig.findFirst({
+            where: { offerId: order.offerId!, enabled: true },
+          });
+          if (config && config.commissionBps > 0) {
+            const commissionCents = Math.floor(order.amountCents * config.commissionBps / 10000);
+            const alreadyHasAffiliateSplit = await prisma.splitRecord.count({
+              where: { orderId, recipientType: 'AFFILIATE' },
+            });
+            if (commissionCents > 0 && alreadyHasAffiliateSplit === 0) {
+              const firstRule = await prisma.splitRule.findFirst({
+              where: { offerId: order.offerId!, isActive: true },
+              orderBy: { createdAt: 'asc' },
+              });
+
+              if (firstRule) await prisma.splitRecord.create({
+                data: {
+                  orderId,
+                  splitRuleId  : firstRule.id,
+                  recipientType: 'AFFILIATE',
+                  recipientId  : affiliate.userId,
+                  amountCents  : commissionCents,
+                  status       : 'PENDING',
+                },
+              });
+            }
+          }
         }
       }
     } catch (splitErr: any) {

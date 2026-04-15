@@ -126,15 +126,29 @@ export class SplitEngineService {
    * Salvar registros de split após pagamento aprovado
    * Registros são IMUTÁVEIS
    */
-  async saveSplitRecords(orderId: string, splits: SplitCalculation[]): Promise<void> {
-    await prisma.splitRecord.createMany({
+  async saveSplitRecords(orderId: string, splits: SplitCalculation[], tx?: any): Promise<void> {
+    const db = tx || prisma;
+
+    // Resolver recipientId do PRODUTOR automaticamente se não definido
+    const order = await db.order.findUnique({
+      where  : { id: orderId },
+      include: { offer: { include: { product: { include: { producer: true } } } } },
+    });
+
+    const producerUserId = order?.offer?.product?.producer?.userId;
+
+    await db.splitRecord.createMany({
       data: splits.map((s) => ({
         orderId,
-        splitRuleId: s.splitRuleId,
+        splitRuleId  : s.splitRuleId,
         recipientType: s.recipientType,
-        recipientId: s.recipientId,
-        amountCents: s.amountCents,
-        status: 'PENDING',
+        recipientId  : s.recipientId
+          ? s.recipientId
+          : s.recipientType === 'PRODUCER'
+            ? (producerUserId || null)
+            : null,
+        amountCents  : s.amountCents,
+        status       : 'PENDING',
       })),
     });
   }
@@ -157,43 +171,34 @@ export class SplitEngineService {
 
   /** Saldo disponível de um usuário (splits pagos - saques) */
   async getUserBalance(userId: string): Promise<{
-    availableCents : number;
-    pendingCents   : number;
-    totalCents     : number;
-    withdrawnCents : number;
+    availableCents: number;
+    pendingCents: number;
+    totalCents: number;
   }> {
-    const [paid, pending, withdrawn] = await Promise.all([
-      // Splits já pagos para este usuário
+    const [available, pending] = await Promise.all([
       prisma.splitRecord.aggregate({
         where: { recipientId: userId, status: 'PAID' },
-        _sum : { amountCents: true },
+        _sum: { amountCents: true },
       }),
-      // Splits ainda pendentes
       prisma.splitRecord.aggregate({
         where: { recipientId: userId, status: 'PENDING' },
-        _sum : { amountCents: true },
-      }),
-      // Saques já pagos ou em processamento
-      prisma.withdrawal.aggregate({
-        where: { userId, status: { in: ['PAID', 'PROCESSING'] } },
-        _sum : { amountCents: true },
+        _sum: { amountCents: true },
       }),
     ]);
 
-    const totalPaid      = paid._sum.amountCents      || 0;
-    const totalPending   = pending._sum.amountCents   || 0;
-    const totalWithdrawn = withdrawn._sum.amountCents || 0;
+    const withdrawals = await prisma.withdrawal.aggregate({
+      where: { userId, status: { in: ['PAID', 'PROCESSING'] } },
+      _sum: { amountCents: true },
+    });
 
-    // availableCents = ganhos PAID - já sacados
-    // pendingCents   = ganhos ainda não confirmados (splits PENDING)
-    // totalCents     = tudo que o produtor ganhou (PAID + PENDING)
-    // withdrawnCents = total já sacado
+    const totalPaid = available._sum.amountCents || 0;
+    const totalWithdrawn = withdrawals._sum.amountCents || 0;
+    const availableCents = totalPaid - totalWithdrawn;
 
     return {
-      availableCents: Math.max(0, totalPaid - totalWithdrawn),
-      pendingCents  : totalPending,
-      totalCents    : totalPaid + totalPending,
-      withdrawnCents: totalWithdrawn,
+      availableCents: Math.max(0, availableCents),
+      pendingCents: pending._sum.amountCents || 0,
+      totalCents: totalPaid,
     };
   }
 }

@@ -1,5 +1,5 @@
 // Kairos Way — Schema Prisma Completo
-// Versão 1.0 — Março/2026
+// Versão 1.1 — Abril/2026
 
 generator client {
   provider      = "prisma-client-js"
@@ -168,7 +168,7 @@ model User {
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
   deletedAt      DateTime?
-
+  showCoproducerWelcome Boolean @default(false)
   sessions      Session[]
   producer      Producer?
   affiliate     Affiliate?
@@ -296,10 +296,12 @@ model Offer {
   updatedAt    DateTime  @updatedAt
   deletedAt    DateTime?
 
-  product       Product      @relation(fields: [productId], references: [id])
-  splitRules    SplitRule[]
-  orders        Order[]
-  checkoutConfig CheckoutConfig?
+  product              Product               @relation(fields: [productId], references: [id])
+  splitRules           SplitRule[]
+  orders               Order[]
+  checkoutConfig       CheckoutConfig?
+  affiliateConfig      AffiliateConfig?
+  affiliateEnrollments AffiliateEnrollment[]
 
   @@index([productId])
   @@index([slug])
@@ -314,11 +316,10 @@ model SplitRule {
   offerId         String
   recipientType   RecipientType
   recipientId     String?
-  basisPoints     Int           // 1% = 100 bps; 100% = 10000 bps
+  basisPoints     Int
   description     String?
   isActive        Boolean       @default(true)
   createdAt       DateTime      @default(now())
-  // IMUTÁVEL — inativar e criar novo se precisar alterar
 
   offer         Offer         @relation(fields: [offerId], references: [id])
   splitRecords  SplitRecord[]
@@ -328,19 +329,18 @@ model SplitRule {
 }
 
 model SplitRecord {
-  id            String      @id @default(cuid())
-  orderId       String
-  splitRuleId   String
-  recipientType RecipientType
-  recipientId   String?
-  amountCents   Int         // IMUTÁVEL — valor real calculado
-  status        SplitStatus @default(PENDING)
+  id              String        @id @default(cuid())
+  orderId         String
+  splitRuleId     String
+  recipientType   RecipientType
+  recipientId     String?
+  amountCents     Int
+  status          SplitStatus   @default(PENDING)
   acquirerSplitId String?
-  paidAt        DateTime?
-  failedAt      DateTime?
-  failReason    String?
-  createdAt     DateTime    @default(now())
-  // NUNCA DELETAR OU ALTERAR
+  paidAt          DateTime?
+  failedAt        DateTime?
+  failReason      String?
+  createdAt       DateTime      @default(now())
 
   order      Order      @relation(fields: [orderId], references: [id])
   splitRule  SplitRule  @relation(fields: [splitRuleId], references: [id])
@@ -355,7 +355,7 @@ model SplitRecord {
 // ══════════════════════════════════════════════════════
 
 model Order {
-  id              String        @id @default(cuid())
+  id              String         @id @default(cuid())
   offerId         String
   affiliateId     String?
   customerId      String?
@@ -364,16 +364,16 @@ model Order {
   customerDoc     String?
   customerPhone   String?
   amountCents     Int
-  status          OrderStatus   @default(PENDING)
+  status          OrderStatus    @default(PENDING)
   paymentMethod   PaymentMethod?
   acquirer        AcquirerName?
   acquirerTxId    String?
-  cardToken       String?       // TOKEN DO ADQUIRENTE — nunca dados brutos
+  cardToken       String?
   pixCode         String?
   pixQrCode       String?
   boletoUrl       String?
   boletoBarcode   String?
-  installments    Int           @default(1)
+  installments    Int            @default(1)
   ipAddress       String?
   userAgent       String?
   fingerprint     String?
@@ -382,8 +382,8 @@ model Order {
   rejectedAt      DateTime?
   refundedAt      DateTime?
   chargebackAt    DateTime?
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
 
   offer         Offer           @relation(fields: [offerId], references: [id])
   affiliate     Affiliate?      @relation(fields: [affiliateId], references: [id])
@@ -404,25 +404,25 @@ model Order {
 // ══════════════════════════════════════════════════════
 
 model Subscription {
-  id              String    @id @default(cuid())
+  id              String        @id @default(cuid())
   offerId         String
   customerId      String?
   customerEmail   String
   customerName    String?
   cardToken       String?
   acquirer        AcquirerName?
-  status          SubStatus @default(ACTIVE)
+  status          SubStatus     @default(ACTIVE)
   cycle           SubCycle
   priceCents      Int
   nextChargeAt    DateTime
-  retryCount      Int       @default(0)
+  retryCount      Int           @default(0)
   lastChargedAt   DateTime?
   lastFailAt      DateTime?
   cancelledAt     DateTime?
   cancelReason    String?
   metadata        Json?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
 
   @@index([status])
   @@index([nextChargeAt])
@@ -434,31 +434,71 @@ model Subscription {
 // ══════════════════════════════════════════════════════
 
 model Affiliate {
-  id          String   @id @default(cuid())
-  userId      String   @unique
-  code        String   @unique
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  code         String   @unique
+  isActive     Boolean  @default(false)
+  status       String   @default("PENDING") // PENDING | APPROVED | REJECTED
+  approvedBy   String?
+  approvedAt   DateTime?
+  rejectedBy   String?
+  rejectedAt   DateTime?
+  rejectedReason String?
+  canCreateProducts Boolean @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
-  user       User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
-  trackings  AffiliateTracking[]
-  orders     Order[]
+  user        User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trackings   AffiliateTracking[]
+  orders      Order[]
+  enrollments AffiliateEnrollment[]
 
   @@index([code])
 }
 
 model AffiliateTracking {
-  id           String   @id @default(cuid())
-  affiliateId  String
-  offerId      String
-  orderId      String?
-  ip           String?
-  userAgent    String?
-  clickedAt    DateTime @default(now())
+  id          String   @id @default(cuid())
+  affiliateId String
+  offerId     String
+  orderId     String?
+  ip          String?
+  userAgent   String?
+  clickedAt   DateTime @default(now())
 
   affiliate Affiliate @relation(fields: [affiliateId], references: [id], onDelete: Cascade)
 
+  @@index([affiliateId])
+  @@index([offerId])
+}
+
+model AffiliateConfig {
+  id            String   @id @default(cuid())
+  offerId       String   @unique
+  enabled       Boolean  @default(true)
+  commissionBps Int
+  cookieDays    Int      @default(30)
+  description   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  offer Offer @relation(fields: [offerId], references: [id], onDelete: Cascade)
+
+  @@index([offerId])
+}
+
+model AffiliateEnrollment {
+  id          String   @id @default(cuid())
+  affiliateId String
+  offerId     String
+  status      String   @default("ACTIVE")
+  link        String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  affiliate Affiliate @relation(fields: [affiliateId], references: [id], onDelete: Cascade)
+  offer     Offer     @relation(fields: [offerId], references: [id], onDelete: Cascade)
+
+  @@unique([affiliateId, offerId])
   @@index([affiliateId])
   @@index([offerId])
 }
@@ -489,14 +529,14 @@ model CoproducerProduct {
 }
 
 model CoproducerRequest {
-  id           String   @id @default(cuid())
-  userId       String
-  productId    String
-  message      String?
-  status       String   @default("PENDING") // PENDING | APPROVED | REJECTED
-  resolvedBy   String?
-  resolvedAt   DateTime?
-  createdAt    DateTime @default(now())
+  id         String    @id @default(cuid())
+  userId     String
+  productId  String?
+  message    String?
+  status     String    @default("PENDING")
+  resolvedBy String?
+  resolvedAt DateTime?
+  createdAt  DateTime  @default(now())
 
   @@index([productId])
   @@index([userId])
@@ -507,26 +547,26 @@ model CoproducerRequest {
 // ══════════════════════════════════════════════════════
 
 model CheckoutConfig {
-  id              String  @id @default(cuid())
-  offerId         String  @unique
-  primaryColor    String  @default("#0055FE")
-  bgColor         String  @default("#02030B")
-  logoUrl         String?
-  customDomain    String?
-  pixEnabled      Boolean @default(true)
-  cardEnabled     Boolean @default(true)
-  boletoEnabled   Boolean @default(false)
-  maxInstallments Int     @default(12)
-  passInstFee     Boolean @default(true)
-  orderBumpOfferId String?
-  upsellOfferId   String?
-  countdownMinutes Int?
-  guaranteeDays   Int?
-  facebookPixelId String?
-  gtmId           String?
-  threatMetrixEnabled Boolean @default(false)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id                  String   @id @default(cuid())
+  offerId             String   @unique
+  primaryColor        String   @default("#0055FE")
+  bgColor             String   @default("#02030B")
+  logoUrl             String?
+  customDomain        String?
+  pixEnabled          Boolean  @default(true)
+  cardEnabled         Boolean  @default(true)
+  boletoEnabled       Boolean  @default(false)
+  maxInstallments     Int      @default(12)
+  passInstFee         Boolean  @default(true)
+  orderBumpOfferId    String?
+  upsellOfferId       String?
+  countdownMinutes    Int?
+  guaranteeDays       Int?
+  facebookPixelId     String?
+  gtmId               String?
+  threatMetrixEnabled Boolean  @default(false)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
 
   offer Offer @relation(fields: [offerId], references: [id])
 }
@@ -555,35 +595,35 @@ model Shipment {
 // ══════════════════════════════════════════════════════
 
 model Withdrawal {
-  id            String         @id @default(cuid())
-  userId        String
-  amountCents   Int
-  pixKey        String
-  pixKeyType    String
-  status        WithdrawStatus @default(PENDING)
-  acquirerTxId  String?
-  processedAt   DateTime?
-  failedAt      DateTime?
-  failReason    String?
-  metadata      Json?
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
+  id           String         @id @default(cuid())
+  userId       String
+  amountCents  Int
+  pixKey       String
+  pixKeyType   String
+  status       WithdrawStatus @default(PENDING)
+  acquirerTxId String?
+  processedAt  DateTime?
+  failedAt     DateTime?
+  failReason   String?
+  metadata     Json?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
 
   @@index([userId])
   @@index([status])
 }
 
 model PlatformInvoice {
-  id             String   @id @default(cuid())
-  producerId     String
-  periodStart    DateTime
-  periodEnd      DateTime
-  volumeCents    Int
-  spreadBps      Int
-  amountCents    Int
-  status         String   @default("PENDING")
-  paidAt         DateTime?
-  createdAt      DateTime @default(now())
+  id          String   @id @default(cuid())
+  producerId  String
+  periodStart DateTime
+  periodEnd   DateTime
+  volumeCents Int
+  spreadBps   Int
+  amountCents Int
+  status      String   @default("PENDING")
+  paidAt      DateTime?
+  createdAt   DateTime @default(now())
 
   @@index([producerId])
   @@index([status])
@@ -620,16 +660,16 @@ model WebhookEvent {
 }
 
 model WebhookDelivery {
-  id              String                @id @default(cuid())
-  endpointId      String
-  eventId         String
-  status          WebhookDeliveryStatus @default(PENDING)
-  httpStatus      Int?
-  responseBody    String?
-  attemptCount    Int                   @default(0)
-  lastAttemptAt   DateTime?
-  deliveredAt     DateTime?
-  createdAt       DateTime              @default(now())
+  id            String                @id @default(cuid())
+  endpointId    String
+  eventId       String
+  status        WebhookDeliveryStatus @default(PENDING)
+  httpStatus    Int?
+  responseBody  String?
+  attemptCount  Int                   @default(0)
+  lastAttemptAt DateTime?
+  deliveredAt   DateTime?
+  createdAt     DateTime              @default(now())
 
   endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
   event    WebhookEvent    @relation(fields: [eventId], references: [id], onDelete: Cascade)
@@ -669,7 +709,7 @@ model PushToken {
   id        String   @id @default(cuid())
   userId    String
   token     String   @unique
-  platform  String   // ios | android | web
+  platform  String
   createdAt DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -680,19 +720,19 @@ model FunnelGoal {
   producerId  String
   name        String
   targetCents Int
-  period      String   // monthly | quarterly | annual
+  period      String
   startDate   DateTime
   endDate     DateTime
   createdAt   DateTime @default(now())
 }
 
 model ReferralProgram {
-  id           String   @id @default(cuid())
-  referrerId   String
-  referredId   String
+  id            String   @id @default(cuid())
+  referrerId    String
+  referredId    String
   commissionBps Int
-  status       String   @default("ACTIVE")
-  createdAt    DateTime @default(now())
+  status        String   @default("ACTIVE")
+  createdAt     DateTime @default(now())
 
   @@index([referrerId])
 }

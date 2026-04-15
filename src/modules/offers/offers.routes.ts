@@ -4,14 +4,14 @@ import { z } from 'zod';
 import { authenticate, requireRole } from '../../shared/middleware/auth.middleware';
 import { SplitEngineService } from '../split-engine/split-engine.service';
 import { prisma } from '../../shared/utils/prisma';
-import { NotFoundError, ForbiddenError, ValidationError } from '../../shared/errors/AppError';
+import { NotFoundError, ForbiddenError } from '../../shared/errors/AppError';
 import { nanoid } from 'nanoid';
 
 const splitEngine = new SplitEngineService();
 
 export async function offerRoutes(app: FastifyInstance) {
   // POST /offers (criar oferta para um produto)
-  app.post('/', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+  app.post('/', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')] }, async (req, reply) => {
     const body = z.object({
       productId: z.string(),
       name: z.string().min(3),
@@ -23,7 +23,7 @@ export async function offerRoutes(app: FastifyInstance) {
     // Verificar propriedade do produto
     const product = await prisma.product.findUnique({ where: { id: body.productId } });
     if (!product) throw new NotFoundError('Produto');
-    if (req.user.role === 'PRODUCER') {
+    if (req.user.role === 'PRODUCER' || req.user.role === 'AFFILIATE') {
       const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
       if (product.producerId !== producer?.id) throw new ForbiddenError();
     }
@@ -65,7 +65,7 @@ export async function offerRoutes(app: FastifyInstance) {
   });
 
   // PUT /offers/:id (atualiza — inativa antiga, cria nova versão de splits)
-  app.put('/:id', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+  app.put('/:id', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = z.object({
       name: z.string().optional(),
@@ -79,7 +79,7 @@ export async function offerRoutes(app: FastifyInstance) {
   });
 
   // POST /offers/:id/splits — configurar splits de uma oferta
-  app.post('/:id/splits', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+  app.post('/:id/splits', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = z.object({
       splits: z.array(z.object({
@@ -90,42 +90,7 @@ export async function offerRoutes(app: FastifyInstance) {
       })),
     }).parse(req.body);
 
-    // REGRA DE NEGÓCIO: taxa da plataforma sempre 5% (500 bps) — não configurável pelo produtor
-    const PLATFORM_FEE_BPS = 500;
-
-    // Remove qualquer PLATFORM que o produtor tente enviar
-    const userSplits = body.splits.filter((s: any) => s.recipientType !== 'PLATFORM');
-
-    // Valida que os splits do produtor somam exatamente 9500 bps (95%)
-    const userTotal = userSplits.reduce((s: number, r: any) => s + r.basisPoints, 0);
-    if (userTotal !== 10000 - PLATFORM_FEE_BPS) {
-      throw new ValidationError(
-        `Seus splits devem somar 95% (9500 bps) — 5% é reservado para a plataforma. Atual: ${userTotal} bps (${userTotal / 100}%)`
-      );
-    }
-
-    // Preencher recipientId automaticamente por tipo
-    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
-
-    const splitsNormalized = [
-      // Taxa da plataforma sempre primeiro e sempre 5%
-      {
-        recipientType: 'PLATFORM' as const,
-        recipientId  : process.env.PLATFORM_USER_ID ?? 'platform',
-        basisPoints  : PLATFORM_FEE_BPS,
-        description  : 'Taxa da plataforma (5%)',
-      },
-      // Splits do produtor com recipientId normalizado
-      ...userSplits.map((s: any) => ({
-        ...s,
-        recipientId:
-          s.recipientType === 'PRODUCER'
-            ? producer?.userId ?? s.recipientId
-            : s.recipientId ?? null,
-      })),
-    ];
-
-    await splitEngine.configureSplits(id, splitsNormalized);
+    await splitEngine.configureSplits(id, body.splits);
     const updated = await splitEngine.getOfferSplits(id);
     return reply.send({ message: 'Splits configurados com sucesso', splits: updated });
   });

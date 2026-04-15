@@ -10,13 +10,12 @@ const auditService = new AuditService();
 export async function productRoutes(app: FastifyInstance) {
 
   // POST /products
-  app.post('/', { preHandler: [authenticate, requireRole('PRODUCER')] }, async (req, reply) => {
+  app.post('/', { preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')] }, async (req, reply) => {
     const body = z.object({
       name: z.string().min(3),
       description: z.string().optional(),
       type: z.enum(['PHYSICAL', 'DIGITAL', 'SUBSCRIPTION', 'BUNDLE']),
-      imageUrl  : z.string().url().optional(),
-      digitalUrl: z.string().url().optional(),
+      imageUrl: z.string().url().optional(),
       category: z.string().optional(),
       weightGrams: z.number().int().optional(),
       sku: z.string().optional(),
@@ -38,12 +37,12 @@ export async function productRoutes(app: FastifyInstance) {
   });
 
   // GET /products — meus produtos
-  app.get('/', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+  app.get('/', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')] }, async (req, reply) => {
     const { page = '1', limit = '20', status } = req.query as any;
     const skip = (Number(page) - 1) * Number(limit);
 
     let producerId: string | undefined;
-    if (req.user.role === 'PRODUCER') {
+    if (req.user.role === 'PRODUCER' || req.user.role === 'AFFILIATE') {
       const p = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
       producerId = p?.id;
     }
@@ -51,7 +50,7 @@ export async function productRoutes(app: FastifyInstance) {
     const [data, total] = await Promise.all([
       prisma.product.findMany({
         where: { producerId, status: status || undefined, deletedAt: null },
-        include: { offers: { where: { isActive: true, deletedAt: null }, include: { splitRules: { where: { isActive: true } } } } },
+        include: { offers: { where: { isActive: true }, select: { id: true, name: true, priceCents: true, slug: true, type: true } } },
         orderBy: { createdAt: 'desc' },
         skip, take: Number(limit),
       }),
@@ -61,25 +60,7 @@ export async function productRoutes(app: FastifyInstance) {
     return reply.send({ data, total, page: Number(page), limit: Number(limit) });
   });
 
-  // GET /products/admin/all — admin vê todos os produtos
-  app.get('/admin/all', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
-    const { status } = req.query as any;
-    const where: any = { deletedAt: null };
-    if (status) where.status = status;
-
-    const data = await prisma.product.findMany({
-      where,
-      include: {
-        producer : { include: { user: { select: { name: true, email: true } } } },
-        offers   : { where: { isActive: true, deletedAt: null }, select: { id: true, name: true, priceCents: true, slug: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-
-    return reply.send({ data, total: data.length });
-  });
-
-    // GET /products/:id
+  // GET /products/:id
   app.get('/:id', { preHandler: [authenticate] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const product = await prisma.product.findUnique({
@@ -94,13 +75,12 @@ export async function productRoutes(app: FastifyInstance) {
   });
 
   // PATCH /products/:id
-  app.patch('/:id', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+  app.patch('/:id', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = z.object({
       name: z.string().optional(),
       description: z.string().optional(),
-      imageUrl  : z.string().url().optional(),
-      digitalUrl: z.string().url().optional(),
+      imageUrl: z.string().url().optional(),
       category: z.string().optional(),
       isActive: z.boolean().optional(),
     }).parse(req.body);
@@ -119,7 +99,7 @@ export async function productRoutes(app: FastifyInstance) {
   });
 
   // DELETE /products/:id (soft delete)
-  app.delete('/:id', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+  app.delete('/:id', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     await prisma.product.update({ where: { id }, data: { deletedAt: new Date(), isActive: false } });
     await auditService.log({ userId: req.user.sub, action: 'PRODUCT_DELETED', resource: `product:${id}`, level: 'MEDIUM' });

@@ -36,7 +36,7 @@ export async function financialRoutes(app: FastifyInstance) {
 
     const [data, total] = await Promise.all([
       prisma.splitRecord.findMany({
-        where: { recipientId: req.user.sub, status: status || undefined },
+        where: {recipientId  : req.user.sub, recipientType: req.user.role === 'AFFILIATE' ? 'AFFILIATE' : undefined, status       : status || undefined,},
         include: { order: { select: { createdAt: true, amountCents: true, customerName: true } } },
         orderBy: { createdAt: 'desc' },
         skip, take: Number(limit),

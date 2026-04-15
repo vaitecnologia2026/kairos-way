@@ -19,7 +19,8 @@ export async function checkoutRoutes(app: FastifyInstance) {
   // ── GET /checkout/:slug — dados da oferta ─────────────────────
   app.get('/:slug', async (req, reply) => {
     const { slug } = req.params as { slug: string };
-    const { aff  } = req.query  as { aff?: string };
+    const q    = req.query  as { aff?: string; ref?: string };
+    const aff   = q.aff || q.ref;
 
     const offer = await prisma.offer.findUnique({
       where  : { slug, isActive: true, deletedAt: null },
@@ -59,7 +60,8 @@ export async function checkoutRoutes(app: FastifyInstance) {
     config: { rateLimit: { max: 10, timeWindow: 60_000 } },
   }, async (req, reply) => {
     const { slug } = req.params as { slug: string };
-    const { aff  } = req.query  as { aff?: string };
+    const q2   = req.query  as { aff?: string; ref?: string };
+    const aff  = q2.aff || q2.ref;
 
     const body = z.object({
       customerEmail  : z.string().email(),
@@ -139,6 +141,41 @@ export async function checkoutRoutes(app: FastifyInstance) {
 
         if (orderStatus === 'APPROVED') {
           await splitEngine.saveSplitRecords(order.id, result.splits, tx);
+
+          // Split do afiliado (se houver ?ref= no pedido)
+          if (order.affiliateId) {
+            const affiliate = await tx.affiliate.findUnique({ where: { id: order.affiliateId } });
+            if (affiliate) {
+              const config = await tx.affiliateConfig.findUnique({
+                where: { offerId: offer.id, enabled: true },
+              });
+              if (config && config.commissionBps > 0) {
+                const commissionCents = Math.floor(order.amountCents * config.commissionBps / 10000);
+                if (commissionCents > 0) {
+                  const affRule = await tx.splitRule.findFirst({
+                    where  : { offerId: offer.id, isActive: true },
+                    orderBy: { createdAt: 'asc' },
+                  });
+                  if (!affRule) return
+                  await tx.splitRecord.create({
+                    data: {
+                      orderId      : order.id,
+                      splitRuleId  : affRule.id,
+                      recipientType: 'AFFILIATE',
+                      recipientId  : affiliate.userId,
+                      amountCents  : commissionCents,
+                      status       : 'PENDING',
+                    },
+                  });
+                  // Atualizar tracking com orderId
+                  await tx.affiliateTracking.updateMany({
+                    where: { affiliateId: order.affiliateId, offerId: offer.id, orderId: null },
+                    data : { orderId: order.id },
+                  });
+                }
+              }
+            }
+          }
         }
       });
 
