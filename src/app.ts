@@ -29,6 +29,11 @@ import { webhookRoutes } from './modules/webhooks/webhooks.routes';
 import { reportRoutes } from './modules/reports/reports.routes';
 import { auditRoutes } from './modules/audit/audit.routes';
 import { adminRoutes } from './modules/admin/admin.routes';
+import { dashboardRoutes } from './modules/dashboard/dashboard.routes';
+import { customerRoutes }       from './modules/customer/customer.routes';
+import { notificationRoutes }   from './modules/notifications/notifications.routes';
+import { milestoneRoutes }      from './modules/producers/milestones.routes';
+import { trackingRoutes }       from './modules/tracking/tracking.routes';
 
 // Queue workers
 import { startWorkers } from './shared/queue/workers';
@@ -123,6 +128,11 @@ async function bootstrap() {
   await app.register(reportRoutes,       { prefix: '/reports' });
   await app.register(auditRoutes,        { prefix: '/audit' });
   await app.register(adminRoutes,        { prefix: '/admin' });
+  await app.register(dashboardRoutes,    { prefix: '/dashboard' });
+  await app.register(customerRoutes,     { prefix: '/customer' });
+  await app.register(notificationRoutes, { prefix: '/notifications' });
+  await app.register(milestoneRoutes,    { prefix: '/producers/milestones' });
+  await app.register(trackingRoutes,     { prefix: '/tracking' });
 
   // ── START QUEUE WORKERS ──────────────────────────────────────
   await startWorkers();

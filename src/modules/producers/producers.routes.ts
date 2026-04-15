@@ -72,10 +72,17 @@ export async function producerRoutes(app: FastifyInstance) {
     const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
     if (!producer) throw new NotFoundError('Produtor');
 
-    const [products, recentOrders, balance] = await Promise.all([
+    const orderBase = { offer: { product: { producerId: producer.id } } };
+
+    const now           = new Date();
+    const monthStart    = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const [products, recentOrders, balance,
+           approvedCount, refundStats, chargebackCount, pendingRefundCount,
+           totalRevenueAgg, monthRevenueAgg] = await Promise.all([
       prisma.product.count({ where: { producerId: producer.id, isActive: true } }),
       prisma.order.findMany({
-        where  : { offer: { product: { producerId: producer.id } }, status: 'APPROVED' },
+        where  : { ...orderBase, status: 'APPROVED' },
         take   : 10,
         orderBy: { createdAt: 'desc' },
         include: { offer: { include: { product: { select: { name: true } } } } },
@@ -84,12 +91,112 @@ export async function producerRoutes(app: FastifyInstance) {
         where: { recipientId: req.user.sub, status: 'PENDING' },
         _sum : { amountCents: true },
       }),
+      prisma.order.count({ where: { ...orderBase, status: 'APPROVED' } }),
+      prisma.order.aggregate({
+        where: { ...orderBase, status: 'REFUNDED' },
+        _sum : { amountCents: true },
+        _count: true,
+      }),
+      prisma.order.count({ where: { ...orderBase, status: 'CHARGEBACK' } }),
+      // Pedidos com solicitação de reembolso pendente de análise manual
+      prisma.order.count({
+        where: {
+          ...orderBase,
+          status  : 'PENDING',
+          metadata: { path: ['refundRequest'], not: 'undefined' },
+        },
+      }),
+      // Faturamento total acumulado (todas as vendas aprovadas)
+      prisma.order.aggregate({
+        where: { ...orderBase, status: 'APPROVED' },
+        _sum : { amountCents: true },
+      }),
+      // Faturamento do mês atual
+      prisma.order.aggregate({
+        where: { ...orderBase, status: 'APPROVED', approvedAt: { gte: monthStart } },
+        _sum : { amountCents: true },
+      }),
     ]);
+
+    const refundCount       = refundStats._count;
+    const refundAmountCents = refundStats._sum.amountCents ?? 0;
+    const refundRate        = approvedCount > 0
+      ? Math.round(((refundCount + chargebackCount) / (approvedCount + refundCount + chargebackCount)) * 10000) / 100
+      : 0;
 
     return reply.send({
       products,
       recentOrders,
-      pendingBalanceCents: balance._sum.amountCents || 0,
+      pendingBalanceCents : balance._sum.amountCents           || 0,
+      totalRevenueCents   : totalRevenueAgg._sum.amountCents   || 0,
+      monthRevenueCents   : monthRevenueAgg._sum.amountCents   || 0,
+      refunds: {
+        refundCount,
+        refundAmountCents,
+        chargebackCount,
+        pendingRefundCount,
+        refundRate,
+      },
+    });
+  });
+
+  // ── GET /producers/refunds ────────────────────────────────────
+  app.get('/refunds', {
+    preHandler: [authenticate, requireRole('PRODUCER')],
+  }, async (req, reply) => {
+    const { page = '1', limit = '20' } = req.query as { page?: string; limit?: string };
+    const skip = (Number(page) - 1) * Number(limit);
+
+    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+    if (!producer) throw new NotFoundError('Produtor');
+
+    const orderBase = { offer: { product: { producerId: producer.id } } };
+
+    const [refunded, chargebacks, pending, totalRefunded, totalCB, totalPending] = await Promise.all([
+      prisma.order.findMany({
+        where  : { ...orderBase, status: 'REFUNDED' },
+        orderBy: { updatedAt: 'desc' },
+        skip, take: Number(limit),
+        include: {
+          offer      : { include: { product: { select: { name: true } } } },
+          affiliate  : { include: { user: { select: { name: true } } } },
+        },
+      }),
+      prisma.order.findMany({
+        where  : { ...orderBase, status: 'CHARGEBACK' },
+        orderBy: { updatedAt: 'desc' },
+        take   : Number(limit),
+        include: {
+          offer    : { include: { product: { select: { name: true } } } },
+          affiliate: { include: { user: { select: { name: true } } } },
+        },
+      }),
+      prisma.order.findMany({
+        where  : { ...orderBase, status: 'PENDING', metadata: { path: ['refundRequest'], not: 'undefined' } },
+        orderBy: { updatedAt: 'desc' },
+        take   : Number(limit),
+        include: {
+          offer    : { include: { product: { select: { name: true } } } },
+          affiliate: { include: { user: { select: { name: true } } } },
+        },
+      }),
+      prisma.order.count({ where: { ...orderBase, status: 'REFUNDED' } }),
+      prisma.order.count({ where: { ...orderBase, status: 'CHARGEBACK' } }),
+      prisma.order.count({
+        where: { ...orderBase, status: 'PENDING', metadata: { path: ['refundRequest'], not: 'undefined' } },
+      }),
+    ]);
+
+    const allOrders = [
+      ...refunded.map((o: any)   => ({ ...o, displayStatus: 'REFUNDED'       })),
+      ...chargebacks.map((o: any) => ({ ...o, displayStatus: 'CHARGEBACK'     })),
+      ...pending.map((o: any)     => ({ ...o, displayStatus: 'PENDING_REFUND' })),
+    ].sort((a: any, b: any) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+
+    return reply.send({
+      data : allOrders,
+      total: totalRefunded + totalCB + totalPending,
+      counts: { refunded: totalRefunded, chargebacks: totalCB, pendingReview: totalPending },
     });
   });
 

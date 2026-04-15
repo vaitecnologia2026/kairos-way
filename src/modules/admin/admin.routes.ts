@@ -3,11 +3,11 @@ import { z } from 'zod';
 import { authenticate, requireRole } from '../../shared/middleware/auth.middleware';
 import { prisma } from '../../shared/utils/prisma';
 import { AuditService } from '../audit/audit.service';
-
-const audit = new AuditService();
-
+import { logger } from '../../shared/utils/logger';
 import { whatsAppService } from '../../shared/services/whatsapp.service';
 import { Resend } from 'resend';
+
+const audit = new AuditService();
 
 export async function adminRoutes(app: FastifyInstance) {
 
@@ -220,7 +220,7 @@ export async function adminRoutes(app: FastifyInstance) {
         }
       }
     } catch (splitErr: any) {
-      console.warn('Split não gerado:', splitErr.message);
+      logger.warn({ err: splitErr.message }, 'Admin: split não gerado ao reprocessar pedido');
     }
 
     const digitalUrl  = (order.offer?.product as any)?.digitalUrl;

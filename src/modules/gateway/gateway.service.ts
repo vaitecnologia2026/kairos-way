@@ -2,6 +2,7 @@ import { SplitEngineService, SplitCalculation } from '../split-engine/split-engi
 import { AuditService } from '../audit/audit.service';
 import { PaymentError } from '../../shared/errors/AppError';
 import { AcquirerName, PaymentMethod } from '@prisma/client';
+import { logger } from '../../shared/utils/logger';
 import { PagarmeAdapter } from './acquirers/pagarme/pagarme.adapter';
 import { AsaasAdapter } from './acquirers/asaas/asaas.adapter';
 import { StoneAdapter } from './acquirers/stone/stone.adapter';
@@ -65,6 +66,7 @@ export class GatewayService {
 
     for (const adapter of this.adapters) {
       try {
+        logger.info({ acquirer: adapter.name, offerId: input.offerId, method: input.method, amountCents: input.amountCents }, 'Gateway: tentando adquirente');
         await auditService.log({
           action: 'PAYMENT_ATTEMPT',
           details: { acquirer: adapter.name, offerId: input.offerId, amountCents: input.amountCents },
@@ -74,6 +76,7 @@ export class GatewayService {
         const result = await adapter.processPayment(input, splits);
         result.splits = splits;
 
+        logger.info({ acquirer: adapter.name, acquirerTxId: result.acquirerTxId, status: result.status }, 'Gateway: pagamento aprovado');
         await auditService.log({
           action: 'PAYMENT_SUCCESS',
           details: {
@@ -89,6 +92,7 @@ export class GatewayService {
         const errMsg = err?.message || 'Erro desconhecido';
         errors.push({ acquirer: adapter.name, error: errMsg });
 
+        logger.warn({ acquirer: adapter.name, errMsg }, 'Gateway: adquirente falhou — tentando próximo');
         await auditService.log({
           action: 'ACQUIRER_FAIL',
           details: { acquirer: adapter.name, error: errMsg },
@@ -103,6 +107,7 @@ export class GatewayService {
     }
 
     // Todos os adquirentes falharam
+    logger.error({ offerId: input.offerId, method: input.method, errors }, 'Gateway: todos os adquirentes falharam');
     await auditService.log({
       action: 'ALL_ACQUIRERS_FAILED',
       details: { errors },

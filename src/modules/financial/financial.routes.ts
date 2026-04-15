@@ -122,6 +122,7 @@ export async function financialRoutes(app: FastifyInstance) {
       data : { status: 'PAID', paidAt: new Date() },
     });
 
+    logger.info({ withdrawalId: id, amountCents: withdrawal.amountCents, pixKey: withdrawal.pixKey, processedBy: req.user.sub }, 'Financial: saque confirmado como PAID');
     await audit.log({
       userId : req.user.sub,
       action : 'WITHDRAWAL_PROCESSED',
@@ -198,6 +199,7 @@ export async function financialRoutes(app: FastifyInstance) {
       data : { status: 'FAILED', failedAt: new Date(), failReason: reason || 'Rejeitado pelo admin' },
     });
 
+    logger.info({ withdrawalId: id, reason, rejectedBy: req.user.sub }, 'Financial: saque rejeitado');
     await audit.log({
       userId : req.user.sub,
       action : 'WITHDRAWAL_REJECTED',
@@ -275,6 +277,7 @@ export async function financialRoutes(app: FastifyInstance) {
       details: { count: result.count }, level: 'HIGH',
     });
 
+    logger.info({ count: result.count, triggeredBy: req.user.sub }, 'Financial: repasse-auto executado');
     return reply.send({ message: `${result.count} repasse(s) processado(s) com sucesso!`, processed: result.count });
   });
 }

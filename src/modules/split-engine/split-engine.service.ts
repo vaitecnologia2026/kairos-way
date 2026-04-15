@@ -2,6 +2,7 @@ import { prisma } from '../../shared/utils/prisma';
 import { calcBps, validateSplitSum } from '../../shared/utils/money';
 import { ValidationError, NotFoundError } from '../../shared/errors/AppError';
 import { RecipientType } from '@prisma/client';
+import { logger } from '../../shared/utils/logger';
 
 export interface SplitInput {
   recipientType: RecipientType;
@@ -40,6 +41,7 @@ export class SplitEngineService {
     // Validar soma = 10000 bps (100%)
     const total = splits.reduce((sum, s) => sum + s.basisPoints, 0);
     if (total !== 10000) {
+      logger.error({ offerId, totalBps: total }, 'SplitEngine: soma dos splits inválida');
       throw new ValidationError(
         `Soma dos splits deve ser 100% (10000 bps). Atual: ${total} bps (${total / 100}%)`
       );
@@ -48,15 +50,17 @@ export class SplitEngineService {
     // Validar que cada bps é positivo
     for (const split of splits) {
       if (split.basisPoints <= 0) {
+        logger.error({ offerId, split }, 'SplitEngine: basis points inválido');
         throw new ValidationError('Cada split deve ter basis points positivo');
       }
     }
 
     // Inativar splits anteriores (NUNCA deletar)
-    await prisma.splitRule.updateMany({
+    const { count: inactivated } = await prisma.splitRule.updateMany({
       where: { offerId, isActive: true },
       data: { isActive: false },
     });
+    logger.info({ offerId, inactivated }, 'SplitEngine: splits anteriores inativados');
 
     // Criar novos splits
     await prisma.splitRule.createMany({
@@ -69,6 +73,7 @@ export class SplitEngineService {
         isActive: true,
       })),
     });
+    logger.info({ offerId, count: splits.length, splits: splits.map(s => ({ type: s.recipientType, bps: s.basisPoints })) }, 'SplitEngine: novos splits configurados');
   }
 
   /**
@@ -82,12 +87,14 @@ export class SplitEngineService {
     });
 
     if (rules.length === 0) {
+      logger.error({ offerId }, 'SplitEngine: calculate — oferta sem splits configurados');
       throw new ValidationError(`Oferta ${offerId} não tem splits configurados`);
     }
 
     // Validar soma
     const totalBps = rules.reduce((sum, r) => sum + r.basisPoints, 0);
     if (totalBps !== 10000) {
+      logger.error({ offerId, totalBps }, 'SplitEngine: calculate — soma dos splits corrompida');
       throw new ValidationError(
         `Split inválido: soma = ${totalBps} bps. Esperado: 10000 bps`
       );
@@ -119,6 +126,10 @@ export class SplitEngineService {
       });
     }
 
+    logger.info(
+      { offerId, amountCents, splitCount: calculations.length, total: calculations.reduce((s, c) => s + c.amountCents, 0) },
+      'SplitEngine: cálculo concluído'
+    );
     return calculations;
   }
 
@@ -151,6 +162,7 @@ export class SplitEngineService {
         status       : 'PENDING',
       })),
     });
+    logger.info({ orderId, count: splits.length }, 'SplitEngine: registros de split salvos');
   }
 
   /** Listar splits de uma oferta */

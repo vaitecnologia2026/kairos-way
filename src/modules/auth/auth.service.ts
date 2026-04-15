@@ -6,6 +6,7 @@ import { FastifyInstance } from 'fastify';
 import { prisma } from '../../shared/utils/prisma';
 import { AuditService } from '../audit/audit.service';
 import { enqueueEmail } from '../../shared/queue/enqueue';
+import { logger } from '../../shared/utils/logger';
 import {
   UnauthorizedError,
   LockedError,
@@ -88,6 +89,7 @@ export class AuthService {
 
     const tokens = await this.createSession(user.id, user.role, ip);
     await auditService.log({ userId: user.id, ip, action: 'LOGIN_SUCCESS', level: 'MEDIUM' });
+    logger.info({ userId: user.id, role: user.role, ip }, 'Auth: login bem-sucedido');
     return { ...tokens, user: this.sanitize(user) };
   }
 
@@ -125,11 +127,15 @@ export class AuthService {
       where  : { refreshToken, expiresAt: { gt: new Date() } },
       include: { user: true },
     });
-    if (!session) throw new UnauthorizedError('Refresh token inválido ou expirado');
+    if (!session) {
+      logger.warn('Auth: refresh token não encontrado ou expirado');
+      throw new UnauthorizedError('Refresh token inválido ou expirado');
+    }
 
     try {
       this.fastify.jwt.verify(refreshToken);
     } catch {
+      logger.warn({ userId: session.userId }, 'Auth: refresh token com assinatura inválida — sessão revogada');
       await prisma.session.delete({ where: { id: session.id } });
       throw new UnauthorizedError('Refresh token inválido');
     }
@@ -307,13 +313,18 @@ export class AuthService {
   }
 
   private decryptField(ciphertext: string): string {
-    const buf      = Buffer.from(ciphertext, 'base64');
-    const iv       = buf.subarray(0, 12);
-    const authTag  = buf.subarray(12, 28);
-    const enc      = buf.subarray(28);
-    const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
-    decipher.setAuthTag(authTag);
-    return decipher.update(enc).toString('utf8') + decipher.final('utf8');
+    try {
+      const buf      = Buffer.from(ciphertext, 'base64');
+      const iv       = buf.subarray(0, 12);
+      const authTag  = buf.subarray(12, 28);
+      const enc      = buf.subarray(28);
+      const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
+      decipher.setAuthTag(authTag);
+      return decipher.update(enc).toString('utf8') + decipher.final('utf8');
+    } catch (err: any) {
+      logger.error({ err: err.message }, 'Auth: falha ao descriptografar campo — ENCRYPTION_KEY pode ter mudado');
+      throw err;
+    }
   }
 
   private sanitize(user: any) {

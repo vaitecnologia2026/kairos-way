@@ -19,6 +19,7 @@ enum Role {
   PRODUCER
   COPRODUCER
   AFFILIATE
+  CUSTOMER
 }
 
 enum StaffRole {
@@ -68,6 +69,7 @@ enum SplitStatus {
   PROCESSING
   PAID
   FAILED
+  CANCELLED
 }
 
 enum OrderStatus {
@@ -169,13 +171,16 @@ model User {
   updatedAt      DateTime  @updatedAt
   deletedAt      DateTime?
   showCoproducerWelcome Boolean @default(false)
-  sessions      Session[]
+  dashboardConfig       Json?
+  sessions        Session[]
+  customerOrders  Order[]   @relation("CustomerOrders")
   producer      Producer?
   affiliate     Affiliate?
   coproducer    Coproducer?
   staffMember   StaffMember?
   auditLogs     AuditLog[]
   pushTokens    PushToken[]
+  notifications Notification[]
 
   @@index([email])
   @@index([role])
@@ -387,12 +392,14 @@ model Order {
 
   offer         Offer           @relation(fields: [offerId], references: [id])
   affiliate     Affiliate?      @relation(fields: [affiliateId], references: [id])
+  customer      User?           @relation("CustomerOrders", fields: [customerId], references: [id])
   splitRecords  SplitRecord[]
   shipment      Shipment?
   webhookEvents WebhookEvent[]
 
   @@index([offerId])
   @@index([affiliateId])
+  @@index([customerId])
   @@index([status])
   @@index([acquirerTxId])
   @@index([customerEmail])
@@ -726,6 +733,21 @@ model FunnelGoal {
   createdAt   DateTime @default(now())
 }
 
+model SalesMilestone {
+  id          String   @id @default(cuid())
+  producerId  String                        // User.id do produtor
+  name        String
+  color       String                        // hex, atribuída automaticamente se não fornecida
+  targetType  String   @default("VALUE")    // "VALUE" | "UNITS"
+  targetValue Int                           // centavos se VALUE, quantidade se UNITS
+  reward      String   @db.Text
+  position    Int      @default(0)          // ordem exibição
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([producerId])
+}
+
 model ReferralProgram {
   id            String   @id @default(cuid())
   referrerId    String
@@ -735,4 +757,43 @@ model ReferralProgram {
   createdAt     DateTime @default(now())
 
   @@index([referrerId])
+}
+
+// ══════════════════════════════════════════════════════
+// NOTIFICATIONS
+// ══════════════════════════════════════════════════════
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String   // REFUND_PROCESSED, REFUND_REQUESTED, NEW_SALE, CHARGEBACK
+  title     String
+  body      String
+  orderId   String?
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, isRead])
+  @@index([userId, createdAt])
+}
+
+// ══════════════════════════════════════════════════════
+// TRACKING PIXELS
+// ══════════════════════════════════════════════════════
+
+model TrackingPixel {
+  id         String   @id @default(cuid())
+  producerId String                           // User.id do produtor
+  provider   String                           // FACEBOOK | GA4 | GOOGLE_ADS | TIKTOK | KWAI | CUSTOM
+  name       String                           // label amigável ex: "Meta Pixel Principal"
+  pixelId    String                           // ID do pixel/tag
+  isActive   Boolean  @default(true)
+  // Eventos habilitados: ViewContent | InitiateCheckout | AddPaymentInfo | Purchase
+  events     String[] @default(["ViewContent", "InitiateCheckout", "Purchase"])
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([producerId])
 }

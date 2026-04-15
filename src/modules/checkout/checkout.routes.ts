@@ -6,9 +6,10 @@ import { AuditService } from '../audit/audit.service';
 import { prisma } from '../../shared/utils/prisma';
 import { logger } from '../../shared/utils/logger';
 import { NotFoundError, AppError } from '../../shared/errors/AppError';
-import { authenticate, requireRole } from '../../shared/middleware/auth.middleware';
+import { authenticate, requireRole, optionalAuthenticate } from '../../shared/middleware/auth.middleware';
 import { enqueueNfe, enqueueEmail } from '../../shared/queue/workers';
 import { whatsAppService } from '../../shared/services/whatsapp.service';
+import { notifyNewSale } from '../../shared/utils/notifyNewSale';
 
 const gateway      = new GatewayService();
 const splitEngine  = new SplitEngineService();
@@ -57,7 +58,8 @@ export async function checkoutRoutes(app: FastifyInstance) {
 
   // ── POST /checkout/:slug/pay — processar pagamento ────────────
   app.post('/:slug/pay', {
-    config: { rateLimit: { max: 10, timeWindow: 60_000 } },
+    config    : { rateLimit: { max: 10, timeWindow: 60_000 } },
+    preHandler: [optionalAuthenticate],
   }, async (req, reply) => {
     const { slug } = req.params as { slug: string };
     const q2   = req.query  as { aff?: string; ref?: string };
@@ -86,10 +88,13 @@ export async function checkoutRoutes(app: FastifyInstance) {
       affiliateId = affiliate?.id;
     }
 
+    const customerId = (req as any).user?.sub as string | undefined;
+
     const order = await prisma.order.create({
       data: {
         offerId      : offer.id,
         affiliateId,
+        customerId,
         customerEmail: body.customerEmail,
         customerName : body.customerName,
         customerDoc  : body.customerDoc,
@@ -101,6 +106,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
         userAgent    : req.headers['user-agent'],
       },
     });
+    logger.info({ orderId: order.id, offerId: offer.id, method: body.method, amountCents: offer.priceCents }, 'Checkout: pedido criado');
 
     try {
       const result = await gateway.processPayment({
@@ -123,6 +129,12 @@ export async function checkoutRoutes(app: FastifyInstance) {
           ? 'PROCESSING'
           : 'REJECTED';
 
+      logger.info({ orderId: order.id, acquirer: result.acquirer, acquirerTxId: result.acquirerTxId, orderStatus }, 'Checkout: resposta do gateway recebida');
+
+      // Captura dados do afiliado para notificação (preenchidos dentro da transação)
+      let notifAffiliateUserId: string | undefined;
+      let notifCommissionCents = 0;
+
       // Order + splits em transação atômica
       await prisma.$transaction(async (tx) => {
         await tx.order.update({
@@ -143,6 +155,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
           await splitEngine.saveSplitRecords(order.id, result.splits, tx);
 
           // Split do afiliado (se houver ?ref= no pedido)
+          // A comissão do afiliado SAI da parte do PRODUTOR — nunca é somada ao total
           if (order.affiliateId) {
             const affiliate = await tx.affiliate.findUnique({ where: { id: order.affiliateId } });
             if (affiliate) {
@@ -152,35 +165,72 @@ export async function checkoutRoutes(app: FastifyInstance) {
               if (config && config.commissionBps > 0) {
                 const commissionCents = Math.floor(order.amountCents * config.commissionBps / 10000);
                 if (commissionCents > 0) {
-                  const affRule = await tx.splitRule.findFirst({
-                    where  : { offerId: offer.id, isActive: true },
-                    orderBy: { createdAt: 'asc' },
+                  // Buscar o split record do PRODUTOR para descontar a comissão
+                  const producerRecord = await tx.splitRecord.findFirst({
+                    where: { orderId: order.id, recipientType: 'PRODUCER' },
                   });
-                  if (!affRule) return
+
+                  if (!producerRecord) {
+                    logger.error({ orderId: order.id }, 'Split do produtor não encontrado — comissão de afiliado não registrada');
+                    return;
+                  }
+
+                  const producerAfterCommission = producerRecord.amountCents - commissionCents;
+                  if (producerAfterCommission < 0) {
+                    logger.error({ orderId: order.id, commissionCents, producerCents: producerRecord.amountCents },
+                      'Comissão do afiliado excede o valor do produtor — comissão não registrada');
+                    return;
+                  }
+
+                  // Reduzir o split do produtor pelo valor da comissão
+                  await tx.splitRecord.update({
+                    where: { id: producerRecord.id },
+                    data : { amountCents: producerAfterCommission },
+                  });
+
+                  // Criar o split do afiliado com o mesmo splitRuleId do produtor como referência
                   await tx.splitRecord.create({
                     data: {
                       orderId      : order.id,
-                      splitRuleId  : affRule.id,
+                      splitRuleId  : producerRecord.splitRuleId,
                       recipientType: 'AFFILIATE',
                       recipientId  : affiliate.userId,
                       amountCents  : commissionCents,
                       status       : 'PENDING',
                     },
                   });
-                  // Atualizar tracking com orderId
-                  await tx.affiliateTracking.updateMany({
-                    where: { affiliateId: order.affiliateId, offerId: offer.id, orderId: null },
-                    data : { orderId: order.id },
-                  });
+
+                  // Capturar para notificação (fora da transação)
+                  notifAffiliateUserId = affiliate.userId;
+                  notifCommissionCents = commissionCents;
                 }
               }
             }
           }
         }
+
+        // Linkar tracking ao orderId para QUALQUER status (inclusive PIX/Boleto PENDING)
+        // O webhook de confirmação precisa encontrar o tracking via orderId
+        if (order.affiliateId) {
+          await tx.affiliateTracking.updateMany({
+            where: { affiliateId: order.affiliateId, offerId: offer.id, orderId: null },
+            data : { orderId: order.id },
+          });
+        }
       });
 
       // ── Workers após aprovação ─────────────────────────────────
       if (orderStatus === 'APPROVED') {
+        // Notificação in-app para produtor (e afiliado, se houver)
+        await notifyNewSale({
+          orderId        : order.id,
+          productName    : offer.product.name,
+          amountCents    : offer.priceCents,
+          producerUserId : offer.product.producerId,
+          affiliateUserId: notifAffiliateUserId,
+          commissionCents: notifCommissionCents,
+        });
+
         // Email de confirmação para o cliente
         await enqueueEmail(
           body.customerEmail,
@@ -241,6 +291,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
       });
 
     } catch (err: any) {
+      logger.error({ orderId: order.id, offerId: offer.id, method: body.method, err: err?.message }, 'Checkout: pagamento falhou — pedido rejeitado');
       await prisma.order.update({
         where: { id: order.id },
         data : { status: 'REJECTED', rejectedAt: new Date() },
@@ -330,7 +381,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
       if (!data.id) throw new AppError('Erro ao tokenizar cartão', 502);
       return reply.send({ token: data.id, brand: data.card?.brand });
     } catch (err: any) {
-      console.error('Pagar.me tokenize:', JSON.stringify(err?.response?.data));
+      logger.error({ statusCode: err?.response?.status, data: err?.response?.data }, 'Checkout: erro ao tokenizar cartão');
       const msg = err?.response?.data?.message
                || err?.response?.data?.errors?.[0]?.message
                || 'Erro ao processar cartão';

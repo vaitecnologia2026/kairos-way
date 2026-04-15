@@ -5,10 +5,107 @@ import { authenticate } from '../../shared/middleware/auth.middleware';
 import { prisma } from '../../shared/utils/prisma';
 import { AuditService } from '../audit/audit.service';
 import { AppError, NotFoundError } from '../../shared/errors/AppError';
-import { dispatchWebhookEvent } from '../../shared/queue/workers';
+import { dispatchWebhookEvent } from '../../shared/queue/enqueue';
 import { logger } from '../../shared/utils/logger';
+import { SplitEngineService } from '../split-engine/split-engine.service';
+import { notifyNewSale } from '../../shared/utils/notifyNewSale';
 
-const audit = new AuditService();
+const audit       = new AuditService();
+const splitEngine = new SplitEngineService();
+
+/**
+ * Cria splits após confirmação de pagamento assíncrono (PIX/Boleto via webhook).
+ * Idempotente — seguro chamar múltiplas vezes para o mesmo orderId.
+ * A comissão do afiliado SAI da parte do PRODUTOR.
+ */
+async function criarSplitsAposAprovacao(orderId: string): Promise<void> {
+  // Idempotência: não criar duplicatas se splits já existem
+  const existingSplits = await prisma.splitRecord.count({ where: { orderId } });
+  if (existingSplits > 0) {
+    logger.info({ orderId }, 'Webhook: splits já existem — idempotente, ignorando');
+    return;
+  }
+
+  const order = await prisma.order.findUnique({
+    where  : { id: orderId },
+    include: { offer: { include: { product: true } } },
+  });
+
+  if (!order?.offer) {
+    logger.error({ orderId }, 'Webhook: ordem sem oferta — splits não criados');
+    return;
+  }
+
+  // Carregar producerUserId para splits e notificações
+  const producerUserId = order.offer.product.producerId;
+
+  // Calcular e salvar splits (PRODUTOR + PLATAFORMA)
+  const splits = await splitEngine.calculate(order.offer.id, order.amountCents);
+  await splitEngine.saveSplitRecords(orderId, splits);
+
+  // Comissão do afiliado — sai da parte do PRODUTOR, nunca somada ao total
+  let affiliateUserId: string | undefined;
+  let commissionCents = 0;
+
+  if (order.affiliateId) {
+    const [affiliate, config] = await Promise.all([
+      prisma.affiliate.findUnique({ where: { id: order.affiliateId } }),
+      prisma.affiliateConfig.findUnique({ where: { offerId: order.offer.id, enabled: true } }),
+    ]);
+
+    if (affiliate && config && config.commissionBps > 0) {
+      commissionCents = Math.floor(order.amountCents * config.commissionBps / 10000);
+
+      if (commissionCents > 0) {
+        const producerRecord = await prisma.splitRecord.findFirst({
+          where: { orderId, recipientType: 'PRODUCER' },
+        });
+
+        if (producerRecord && producerRecord.amountCents >= commissionCents) {
+          await prisma.$transaction([
+            prisma.splitRecord.update({
+              where: { id: producerRecord.id },
+              data : { amountCents: producerRecord.amountCents - commissionCents },
+            }),
+            prisma.splitRecord.create({
+              data: {
+                orderId,
+                splitRuleId  : producerRecord.splitRuleId,
+                recipientType: 'AFFILIATE',
+                recipientId  : affiliate.userId,
+                amountCents  : commissionCents,
+                status       : 'PENDING',
+              },
+            }),
+          ]);
+          affiliateUserId = affiliate.userId;
+          logger.info({ orderId, commissionCents, affiliateId: affiliate.id }, 'Webhook: split do afiliado criado');
+        } else {
+          logger.warn({ orderId, commissionCents, producerCents: producerRecord?.amountCents },
+            'Webhook: comissão do afiliado excede parte do produtor — ignorando');
+        }
+
+        // Garantir tracking linkado (PIX/Boleto podem ter chegado sem orderId no tracking)
+        await prisma.affiliateTracking.updateMany({
+          where: { affiliateId: order.affiliateId, offerId: order.offer.id, orderId: null },
+          data : { orderId },
+        });
+      }
+    }
+  }
+
+  // Notificar produtor (e afiliado, se houver comissão)
+  await notifyNewSale({
+    orderId,
+    productName    : order.offer.product.name,
+    amountCents    : order.amountCents,
+    producerUserId,
+    affiliateUserId,
+    commissionCents,
+  });
+
+  logger.info({ orderId }, 'Webhook: splits criados com sucesso');
+}
 
 const WEBHOOK_EVENTS = [
   'payment.approved', 'payment.failed', 'payment.refunded',
@@ -254,9 +351,10 @@ async function processPagarmeWebhook(payload: any) {
   const status = payload.data?.status;
   if (!txId || !status) return;
 
+  // Pagar.me V5: charge events
   const orderStatus =
-    status === 'paid'     ? 'APPROVED' :
-    status === 'refunded' ? 'REFUNDED' :
+    status === 'paid'        ? 'APPROVED'   :
+    status === 'refunded'    ? 'REFUNDED'   :
     status === 'chargedback' ? 'CHARGEBACK' : null;
 
   if (!orderStatus) return;
@@ -264,6 +362,12 @@ async function processPagarmeWebhook(payload: any) {
   const order = await prisma.order.findFirst({ where: { acquirerTxId: txId } });
   if (!order) {
     logger.warn({ txId, status }, 'Pagar.me webhook: pedido não encontrado');
+    return;
+  }
+
+  // Idempotência — não reprocessar status idêntico
+  if (order.status === orderStatus) {
+    logger.info({ txId, orderStatus }, 'Pagar.me webhook: status já atualizado, ignorando');
     return;
   }
 
@@ -276,6 +380,8 @@ async function processPagarmeWebhook(payload: any) {
   });
 
   if (orderStatus === 'APPROVED') {
+    // Criar splits para PIX/Boleto que chegaram como PENDING no checkout
+    await criarSplitsAposAprovacao(order.id);
     await dispatchWebhookEvent('payment.approved', { orderId: order.id, acquirer: 'PAGARME', amountCents: order.amountCents });
   }
 }
@@ -298,6 +404,9 @@ async function processAsaasWebhook(payload: any) {
   const order = await prisma.order.findFirst({ where: { acquirerTxId: paymentId } });
   if (!order) return;
 
+  // Idempotência
+  if (order.status === orderStatus) return;
+
   await prisma.order.update({
     where: { id: order.id },
     data : {
@@ -307,6 +416,7 @@ async function processAsaasWebhook(payload: any) {
   });
 
   if (orderStatus === 'APPROVED') {
+    await criarSplitsAposAprovacao(order.id);
     await dispatchWebhookEvent('payment.approved', { orderId: order.id, acquirer: 'ASAAS', amountCents: order.amountCents });
   }
 }
@@ -321,9 +431,14 @@ async function processStoneWebhook(payload: any) {
 
   const order = await prisma.order.findFirst({ where: { acquirerTxId: txId } });
   if (!order) return;
+  if (order.status === orderStatus) return;
 
   await prisma.order.update({
     where: { id: order.id },
     data : { status: orderStatus as any, approvedAt: orderStatus === 'APPROVED' ? new Date() : undefined },
   });
+
+  if (orderStatus === 'APPROVED') {
+    await criarSplitsAposAprovacao(order.id);
+  }
 }

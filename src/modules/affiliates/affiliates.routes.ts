@@ -5,6 +5,7 @@ import { prisma }                                    from '../../shared/utils/pr
 import { AuditService }                              from '../audit/audit.service';
 import { createId }                                  from '@paralleldrive/cuid2';
 import bcrypt                                          from 'bcryptjs';
+import { logger }                                    from '../../shared/utils/logger';
 
 const audit = new AuditService();
 
@@ -40,7 +41,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     });
 
     // Criar perfil de afiliado com status PENDING
-    await prisma.affiliate.create({
+    const affiliate = await prisma.affiliate.create({
       data: {
         userId  : user.id,
         code    : createId().slice(0, 8).toUpperCase(),
@@ -48,6 +49,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
         status  : 'PENDING',
       },
     });
+    logger.info({ userId: user.id, affiliateId: affiliate.id, email: body.email }, 'Afiliado: cadastro realizado — aguardando aprovação');
 
     return reply.status(201).send({
       message: 'Cadastro realizado! Aguarde a aprovação do produtor para acessar a plataforma.',
@@ -163,6 +165,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       userId : req.user.sub, action: 'AFFILIATE_APPROVED',
       details: { affiliateId: id, affiliateEmail: affiliate.user.email }, level: 'MEDIUM',
     });
+    logger.info({ affiliateId: id, email: affiliate.user.email, approvedBy: req.user.sub }, 'Afiliado: aprovado');
 
     return reply.send({ message: 'Afiliado aprovado com sucesso!' });
   });
@@ -186,6 +189,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       userId : req.user.sub, action: 'AFFILIATE_REJECTED',
       details: { affiliateId: id, reason }, level: 'MEDIUM',
     });
+    logger.info({ affiliateId: id, reason, rejectedBy: req.user.sub }, 'Afiliado: rejeitado');
 
     return reply.send({ message: 'Afiliado rejeitado.' });
   });
@@ -342,7 +346,11 @@ export async function affiliatesRoutes(app: FastifyInstance) {
           ]}
         : orderWhereAffiliate;
 
-    const [available, pending, totalClicks, totalConversions, volume] = await Promise.all([
+    // Filtro de reembolsos/chargebacks para o afiliado
+    const refundWhere = { affiliate: { userId: req.user.sub as string } };
+
+    const [available, pending, totalClicks, totalConversions, volume,
+           refundAgg, chargebackCount, pendingRefundCount] = await Promise.all([
       prisma.splitRecord.aggregate({
         where: { recipientId: req.user.sub, recipientType: { in: ['AFFILIATE', 'PRODUCER'] }, status: 'PAID' },
         _sum : { amountCents: true },
@@ -358,6 +366,20 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       prisma.order.aggregate({
         where: orderWhere,
         _sum : { amountCents: true },
+      }),
+      prisma.order.aggregate({
+        where : { ...refundWhere, status: 'REFUNDED' },
+        _sum  : { amountCents: true },
+        _count: true,
+      }),
+      prisma.order.count({ where: { ...refundWhere, status: 'CHARGEBACK' } }),
+      // Solicitações pendentes de análise manual (gateway falhou)
+      prisma.order.count({
+        where: {
+          ...refundWhere,
+          status  : 'PENDING',
+          metadata: { path: ['refundRequest'], not: 'undefined' },
+        },
       }),
     ]);
 
@@ -383,6 +405,13 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       ? Math.min(100, Math.round(((volumeCents - currentTier.min) / (nextGoal - currentTier.min)) * 100))
       : 100;
 
+    const refundCount       = refundAgg._count;
+    const refundAmountCents = refundAgg._sum.amountCents ?? 0;
+    const totalFinalized    = totalConversions + refundCount + chargebackCount;
+    const refundRate        = totalFinalized > 0
+      ? Math.round(((refundCount + chargebackCount) / totalFinalized) * 10000) / 100
+      : 0;
+
     return reply.send({
       availableCents    : Math.max(0, paidCents - withdrawnCents),
       pendingCents      : pending._sum.amountCents || 0,
@@ -395,6 +424,13 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       tierProgress,
       tierNextGoal      : nextGoal,
       canCreateProducts : affiliateRec?.canCreateProducts || false,
+      refunds: {
+        refundCount,
+        refundAmountCents,
+        chargebackCount,
+        pendingRefundCount,
+        refundRate,
+      },
     });
   });
 
@@ -450,6 +486,120 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     });
 
     return reply.send(Object.values(days));
+  });
+
+  // GET /affiliates/milestones — marcos de todos os produtores + progresso do afiliado
+  app.get('/milestones', { preHandler: [authenticate] }, async (req, reply) => {
+    const userId = (req.user as any).sub as string;
+
+    const affiliate = await prisma.affiliate.findUnique({ where: { userId } });
+    if (!affiliate) return reply.send({ data: [] });
+
+    // Busca todos os milestones agrupados por producerId (User.id do produtor)
+    const allMilestones = await prisma.salesMilestone.findMany({
+      orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
+    });
+
+    if (allMilestones.length === 0) return reply.send({ data: [] });
+
+    // Agrupa por producerId
+    const byProducer = new Map<string, typeof allMilestones>();
+    for (const m of allMilestones) {
+      const arr = byProducer.get(m.producerId) ?? [];
+      arr.push(m);
+      byProducer.set(m.producerId, arr);
+    }
+
+    // Para cada produtor, resolve o nome e calcula o progresso do afiliado
+    const result = await Promise.all(
+      Array.from(byProducer.entries()).map(async ([producerUserId, milestones]) => {
+        // Resolve o Producer record para obter o nome e o id (Producer.id)
+        const producer = await prisma.producer.findUnique({
+          where : { userId: producerUserId },
+          select: { id: true, tradeName: true, companyName: true },
+        });
+
+        const producerName = producer?.tradeName || producer?.companyName || 'Produtor';
+        const producerId   = producer?.id;   // Producer.id para filtrar orders
+
+        const [valueSales, unitSales] = await Promise.all([
+          prisma.order.aggregate({
+            _sum : { amountCents: true },
+            where: {
+              affiliateId: affiliate.id,
+              status     : 'APPROVED',
+              ...(producerId ? { offer: { product: { producerId } } } : {}),
+            },
+          }),
+          prisma.order.count({
+            where: {
+              affiliateId: affiliate.id,
+              status     : 'APPROVED',
+              ...(producerId ? { offer: { product: { producerId } } } : {}),
+            },
+          }),
+        ]);
+
+        const totalValueCents = valueSales._sum.amountCents ?? 0;
+        const totalUnits      = unitSales;
+
+        const milestonesWithProgress = milestones.map(m => {
+          const current    = m.targetType === 'VALUE' ? totalValueCents : totalUnits;
+          const percentage = Math.min(100, Math.round((current / m.targetValue) * 100));
+          const reached    = current >= m.targetValue;
+          return { ...m, current, percentage, reached };
+        });
+
+        return {
+          producer  : { id: producerUserId, name: producerName },
+          milestones: milestonesWithProgress,
+          summary   : { totalValueCents, totalUnits },
+        };
+      })
+    );
+
+    return reply.send({ data: result });
+  });
+
+  // GET /affiliates/my-refunds — lista de reembolsos e chargebacks do afiliado
+  app.get('/my-refunds', { preHandler: [authenticate] }, async (req, reply) => {
+    const { page = '1', limit = '20' } = req.query as { page?: string; limit?: string };
+    const skip = (Number(page) - 1) * Number(limit);
+
+    const affiliate = await prisma.affiliate.findUnique({ where: { userId: req.user.sub } });
+    if (!affiliate) return reply.send({ data: [], total: 0 });
+
+    const baseWhere = { affiliateId: affiliate.id };
+
+    const [refunded, chargebacks, pending] = await Promise.all([
+      prisma.order.findMany({
+        where  : { ...baseWhere, status: 'REFUNDED' },
+        orderBy: { updatedAt: 'desc' },
+        skip, take: Number(limit),
+        include: { offer: { include: { product: { select: { name: true } } } } },
+      }),
+      prisma.order.findMany({
+        where  : { ...baseWhere, status: 'CHARGEBACK' },
+        orderBy: { updatedAt: 'desc' },
+        take   : Number(limit),
+        include: { offer: { include: { product: { select: { name: true } } } } },
+      }),
+      prisma.order.findMany({
+        where  : { ...baseWhere, status: 'PENDING', metadata: { path: ['refundRequest'], not: 'undefined' } },
+        orderBy: { updatedAt: 'desc' },
+        take   : Number(limit),
+        include: { offer: { include: { product: { select: { name: true } } } } },
+      }),
+    ]);
+
+    const allOrders = [
+      ...refunded.map((o: any)   => ({ ...o, displayStatus: 'REFUNDED'  })),
+      ...chargebacks.map((o: any) => ({ ...o, displayStatus: 'CHARGEBACK' })),
+      ...pending.map((o: any)     => ({ ...o, displayStatus: 'PENDING_REFUND' })),
+    ].sort((a: any, b: any) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+
+    const total = refunded.length + chargebacks.length + pending.length;
+    return reply.send({ data: allOrders, total });
   });
 
   // POST /affiliates/track — registrar clique (chamado pelo checkout)

@@ -3,6 +3,7 @@ import { prisma } from '../utils/prisma';
 import { AuditService } from '../../modules/audit/audit.service';
 import { UnauthorizedError, ForbiddenError } from '../errors/AppError';
 import { Role } from '@prisma/client';
+import { logger } from '../utils/logger';
 const auditService = new AuditService();
 declare module 'fastify' {
   interface FastifyRequest {
@@ -22,6 +23,7 @@ export async function authenticate(
   try {
     await request.jwtVerify();
   } catch {
+    logger.warn({ ip: request.ip, url: request.url }, 'Auth: JWT inválido ou expirado');
     throw new UnauthorizedError('Token inválido ou expirado');
   }
   const token = request.headers.authorization?.replace('Bearer ', '');
@@ -29,7 +31,10 @@ export async function authenticate(
   const session = await prisma.session.findFirst({
     where: { accessToken: token, expiresAt: { gt: new Date() } },
   });
-  if (!session) throw new UnauthorizedError('Sessão expirada. Faça login novamente.');
+  if (!session) {
+    logger.warn({ ip: request.ip, url: request.url }, 'Auth: sessão não encontrada ou expirada');
+    throw new UnauthorizedError('Sessão expirada. Faça login novamente.');
+  }
   // Audit log de acesso à API
   await auditService.log({
     userId: (request.user as any).sub,
@@ -40,6 +45,27 @@ export async function authenticate(
     level: 'LOW',
   });
 }
+/** Tenta autenticar sem rejeitar quando não há token (endpoints públicos com auth opcional) */
+export async function optionalAuthenticate(
+  request: FastifyRequest,
+  _reply: FastifyReply
+): Promise<void> {
+  const token = request.headers.authorization?.replace('Bearer ', '');
+  if (!token) return;
+  try {
+    await request.jwtVerify();
+  } catch {
+    delete (request as any).user;
+    return;
+  }
+  const session = await prisma.session.findFirst({
+    where: { accessToken: token, expiresAt: { gt: new Date() } },
+  });
+  if (!session) {
+    delete (request as any).user;
+  }
+}
+
 /** Verifica se o usuário tem o(s) role(s) necessário(s) */
 export function requireRole(...roles: Role[]) {
   return async (request: FastifyRequest, _reply: FastifyReply): Promise<void> => {

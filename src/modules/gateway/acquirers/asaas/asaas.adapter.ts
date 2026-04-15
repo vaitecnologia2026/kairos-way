@@ -3,6 +3,7 @@ import { IAcquirerAdapter, PaymentInput, PaymentResult } from '../../gateway.ser
 import { SplitCalculation } from '../../../split-engine/split-engine.service';
 import { PaymentError } from '../../../../shared/errors/AppError';
 import { AcquirerName } from '@prisma/client';
+import { logger } from '../../../../shared/utils/logger';
 
 export class AsaasAdapter implements IAcquirerAdapter {
   name: AcquirerName = 'ASAAS';
@@ -53,18 +54,27 @@ export class AsaasAdapter implements IAcquirerAdapter {
         result.boletoBarcode = payment.nossoNumero;
       }
 
+      logger.info({ acquirerTxId: payment.id, status: result.status, method: billingType }, 'Asaas: pagamento processado');
       return result;
     } catch (err: any) {
-      throw new PaymentError(`Asaas: ${err?.response?.data?.errors?.[0]?.description || err.message}`);
+      const errMsg = err?.response?.data?.errors?.[0]?.description || err.message;
+      logger.error({ billingType, statusCode: err?.response?.status, errMsg }, 'Asaas: erro ao processar pagamento');
+      throw new PaymentError(`Asaas: ${errMsg}`);
     }
   }
 
   async refund(acquirerTxId: string, amountCents: number): Promise<void> {
-    await axios.post(
-      `${this.apiUrl}/payments/${acquirerTxId}/refund`,
-      { value: amountCents / 100 },
-      { headers: this.headers }
-    );
+    try {
+      await axios.post(
+        `${this.apiUrl}/payments/${acquirerTxId}/refund`,
+        { value: amountCents / 100 },
+        { headers: this.headers }
+      );
+      logger.info({ acquirerTxId, amountCents }, 'Asaas: reembolso processado');
+    } catch (err: any) {
+      logger.error({ acquirerTxId, amountCents, err: err?.response?.data || err.message }, 'Asaas: erro ao processar reembolso');
+      throw err;
+    }
   }
 
   async getStatus(acquirerTxId: string): Promise<string> {
