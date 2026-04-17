@@ -7,7 +7,7 @@ import { prisma } from '../../shared/utils/prisma';
 import { logger } from '../../shared/utils/logger';
 import { NotFoundError, AppError } from '../../shared/errors/AppError';
 import { authenticate, requireRole, optionalAuthenticate } from '../../shared/middleware/auth.middleware';
-import { enqueueNfe, enqueueEmail } from '../../shared/queue/workers';
+import { enqueueNfe, enqueueEmail, enqueueLogistics } from '../../shared/queue/enqueue';
 import { whatsAppService } from '../../shared/services/whatsapp.service';
 import { notifyNewSale } from '../../shared/utils/notifyNewSale';
 
@@ -247,6 +247,11 @@ export async function checkoutRoutes(app: FastifyInstance) {
 
         // Emitir NF-e (apenas para produtos digitais — o worker filtra)
         await enqueueNfe(order.id);
+
+        // Logística — criar shipment WAITING para produtos físicos (produtor despacha depois)
+        if (offer.product.type === 'PHYSICAL') {
+          await enqueueLogistics(order.id);
+        }
 
         // WhatsApp — enviar link do produto digital ao cliente (só se tiver digitalUrl e telefone)
         const digitalUrl = (offer.product as any).digitalUrl;

@@ -346,8 +346,44 @@ function startNfeWorker(): Worker {
 function startLogisticsWorker(): Worker {
   const worker = new Worker('logistics', async (job) => {
     const { orderId } = job.data;
-    logger.info({ orderId }, '📦 Fulfillment — TODO: integrar fornecedor');
+
+    const order = await prisma.order.findUnique({
+      where  : { id: orderId },
+      include: { offer: { include: { product: true } }, shipment: true },
+    });
+
+    if (!order) {
+      logger.warn({ orderId }, 'Logistics worker: pedido não encontrado');
+      return;
+    }
+
+    // Só processa produtos físicos
+    if (order.offer.product.type !== 'PHYSICAL') {
+      logger.info({ orderId, type: order.offer.product.type }, 'Logistics worker: produto não-físico, ignorando');
+      return;
+    }
+
+    // Se já tem shipment, não recria
+    if (order.shipment) {
+      logger.info({ orderId, shipmentId: order.shipment.id }, 'Logistics worker: shipment já existe');
+      return;
+    }
+
+    // Criar registro de Shipment com status WAITING (aguardando despacho pelo produtor)
+    await prisma.shipment.create({
+      data: {
+        order  : { connect: { id: orderId } },
+        carrier: 'JADLOG',
+        status : 'WAITING',
+      },
+    });
+
+    logger.info({ orderId }, '📦 Logistics worker: shipment WAITING criado — produtor precisa despachar via /logistics/jadlog/ship');
   }, { connection: redisConnection });
+
+  worker.on('failed', (job, err) => {
+    logger.error({ jobId: job?.id, err: err.message }, 'Logistics worker falhou');
+  });
 
   return worker;
 }

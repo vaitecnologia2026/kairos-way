@@ -1,4 +1,4 @@
-import { emailQueue, nfeQueue, repasesQueue, webhookQueue } from './queues';
+import { emailQueue, nfeQueue, repasesQueue, webhookQueue, logisticsQueue } from './queues';
 import { prisma } from '../utils/prisma';
 import { logger } from '../utils/logger';
 
@@ -26,6 +26,12 @@ export async function enqueueNfe(orderId: string): Promise<void> {
 export async function enqueueRepasse(withdrawalId: string): Promise<void> {
   await repasesQueue.add('process', { withdrawalId });
   logger.debug({ withdrawalId }, 'Queue: repasse enfileirado');
+}
+
+export async function enqueueLogistics(orderId: string): Promise<void> {
+  // Delay de 3s para garantir que splits e dados foram persistidos
+  await logisticsQueue.add('fulfill', { orderId }, { delay: 3_000 });
+  logger.debug({ orderId }, 'Queue: logistics enfileirado');
 }
 
 export async function dispatchWebhookEvent(
