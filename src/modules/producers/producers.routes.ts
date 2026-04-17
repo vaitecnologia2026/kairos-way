@@ -72,7 +72,15 @@ export async function producerRoutes(app: FastifyInstance) {
     const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
     if (!producer) throw new NotFoundError('Produtor');
 
-    const orderBase = { offer: { product: { producerId: producer.id } } };
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    const dateFilter: any = {};
+    if (startDate) dateFilter.gte = new Date(`${startDate}T00:00:00.000Z`);
+    if (endDate)   dateFilter.lte = new Date(`${endDate}T23:59:59.999Z`);
+
+    const orderBase: any = { offer: { product: { producerId: producer.id } } };
+    const orderDateFilter: any = { ...orderBase, status: 'APPROVED' };
+    if (startDate || endDate) orderDateFilter.approvedAt = dateFilter;
 
     const now           = new Date();
     const monthStart    = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -82,7 +90,7 @@ export async function producerRoutes(app: FastifyInstance) {
            totalRevenueAgg, monthRevenueAgg] = await Promise.all([
       prisma.product.count({ where: { producerId: producer.id, isActive: true } }),
       prisma.order.findMany({
-        where  : { ...orderBase, status: 'APPROVED' },
+        where  : orderDateFilter,
         take   : 10,
         orderBy: { createdAt: 'desc' },
         include: { offer: { include: { product: { select: { name: true } } } } },
@@ -91,14 +99,13 @@ export async function producerRoutes(app: FastifyInstance) {
         where: { recipientId: req.user.sub, status: 'PENDING' },
         _sum : { amountCents: true },
       }),
-      prisma.order.count({ where: { ...orderBase, status: 'APPROVED' } }),
+      prisma.order.count({ where: orderDateFilter }),
       prisma.order.aggregate({
-        where: { ...orderBase, status: 'REFUNDED' },
+        where: { ...orderBase, status: 'REFUNDED', ...(startDate || endDate ? { updatedAt: dateFilter } : {}) },
         _sum : { amountCents: true },
         _count: true,
       }),
-      prisma.order.count({ where: { ...orderBase, status: 'CHARGEBACK' } }),
-      // Pedidos com solicitação de reembolso pendente de análise manual
+      prisma.order.count({ where: { ...orderBase, status: 'CHARGEBACK', ...(startDate || endDate ? { updatedAt: dateFilter } : {}) } }),
       prisma.order.count({
         where: {
           ...orderBase,
@@ -106,9 +113,9 @@ export async function producerRoutes(app: FastifyInstance) {
           metadata: { path: ['refundRequest'], not: 'undefined' },
         },
       }),
-      // Faturamento total acumulado (todas as vendas aprovadas)
+      // Faturamento no período selecionado (ou total se sem filtro)
       prisma.order.aggregate({
-        where: { ...orderBase, status: 'APPROVED' },
+        where: orderDateFilter,
         _sum : { amountCents: true },
       }),
       // Faturamento do mês atual

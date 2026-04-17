@@ -7,12 +7,15 @@ export async function reportRoutes(app: FastifyInstance) {
 
   // GET /reports/sales
   app.get('/sales', { preHandler: [authenticate] }, async (req, reply) => {
-    const { from, to, page = '1', limit = '50', status } = req.query as any;
+    const { from, to, startDate, endDate, page = '1', limit = '50', status } = req.query as any;
     const skip = (Number(page) - 1) * Number(limit);
 
+    const dateFrom = from || startDate;
+    const dateTo   = to   || endDate;
+
     const where: any = {};
-    if (from) where.createdAt = { gte: new Date(from) };
-    if (to)   where.createdAt = { ...(where.createdAt || {}), lte: new Date(to) };
+    if (dateFrom) where.createdAt = { gte: new Date(`${dateFrom}T00:00:00.000Z`) };
+    if (dateTo)   where.createdAt = { ...(where.createdAt || {}), lte: new Date(`${dateTo}T23:59:59.999Z`) };
     if (status) where.status = status;
 
     if (req.user.role === 'PRODUCER') {

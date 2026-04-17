@@ -12,12 +12,21 @@ const audit = new AuditService();
 export async function adminRoutes(app: FastifyInstance) {
 
   // GET /admin/dashboard
-  app.get('/dashboard', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (_req, reply) => {
+  app.get('/dashboard', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { startDate, endDate } = req.query as { startDate?: string; endDate?: string };
+
+    const dateFilter: any = {};
+    if (startDate) dateFilter.gte = new Date(`${startDate}T00:00:00.000Z`);
+    if (endDate)   dateFilter.lte = new Date(`${endDate}T23:59:59.999Z`);
+
+    const orderWhere: any = { status: 'APPROVED' };
+    if (startDate || endDate) orderWhere.approvedAt = dateFilter;
+
     const [totalProducers, pendingKyc, totalOrders, revenue, activeSubscriptions] = await Promise.all([
       prisma.producer.count({ where: { isActive: true } }),
       prisma.producer.count({ where: { kycStatus: 'PENDING' } }),
-      prisma.order.count({ where: { status: 'APPROVED' } }),
-      prisma.order.aggregate({ where: { status: 'APPROVED' }, _sum: { amountCents: true } }),
+      prisma.order.count({ where: orderWhere }),
+      prisma.order.aggregate({ where: orderWhere, _sum: { amountCents: true } }),
       prisma.subscription.count({ where: { status: 'ACTIVE' } }),
     ]);
 

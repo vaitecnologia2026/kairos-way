@@ -320,8 +320,14 @@ export async function affiliatesRoutes(app: FastifyInstance) {
 
   // GET /affiliates/my-stats — resumo financeiro do afiliado
   // Query param: filter = 'all' | 'own' | 'affiliate' (default: 'all')
+  // Query param: startDate, endDate (YYYY-MM-DD) — filtro de data
   app.get('/my-stats', { preHandler: [authenticate] }, async (req, reply) => {
-    const { filter = 'all' } = req.query as { filter?: string };
+    const { filter = 'all', startDate, endDate } = req.query as { filter?: string; startDate?: string; endDate?: string };
+
+    const dateFilter: any = {};
+    if (startDate) dateFilter.gte = new Date(`${startDate}T00:00:00.000Z`);
+    if (endDate)   dateFilter.lte = new Date(`${endDate}T23:59:59.999Z`);
+    const hasDateFilter = !!(startDate || endDate);
 
     // Buscar producer record e flag canCreateProducts
     const [producer, affiliateRec] = await Promise.all([
@@ -330,9 +336,10 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     ]);
 
     // Montar condições de pedidos por filtro
-    const orderWhereAffiliate = { affiliate: { userId: req.user.sub }, status: 'APPROVED' as const };
+    const dtWhere = hasDateFilter ? { approvedAt: dateFilter } : {};
+    const orderWhereAffiliate = { affiliate: { userId: req.user.sub }, status: 'APPROVED' as const, ...dtWhere };
     const orderWhereOwn       = producer
-      ? { offer: { product: { producerId: producer.id } }, status: 'APPROVED' as const, affiliateId: null }
+      ? { offer: { product: { producerId: producer.id } }, status: 'APPROVED' as const, affiliateId: null, ...dtWhere }
       : null;
 
     const orderWhere =
@@ -340,7 +347,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       filter === 'own'       ? (orderWhereOwn ?? { id: 'none' }) :
       // 'all' — afiliações + produtos próprios
       producer
-        ? { status: 'APPROVED' as const, OR: [
+        ? { status: 'APPROVED' as const, ...dtWhere, OR: [
             { affiliate: { userId: req.user.sub } },
             { offer: { product: { producerId: producer.id } } },
           ]}
@@ -434,27 +441,31 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     });
   });
 
-  // GET /affiliates/my-chart — receita diária dos últimos 14 dias
-  // Query param: filter = 'all' | 'own' | 'affiliate' (default: 'all')
+  // GET /affiliates/my-chart — receita diária
+  // Query params: filter, startDate, endDate
   app.get('/my-chart', { preHandler: [authenticate] }, async (req, reply) => {
-    const { filter = 'all' } = req.query as { filter?: string };
+    const { filter = 'all', startDate, endDate } = req.query as { filter?: string; startDate?: string; endDate?: string };
 
-    const since = new Date();
-    since.setDate(since.getDate() - 13);
-    since.setHours(0, 0, 0, 0);
+    const since = startDate
+      ? new Date(`${startDate}T00:00:00.000Z`)
+      : (() => { const d = new Date(); d.setDate(d.getDate() - 13); d.setHours(0, 0, 0, 0); return d; })();
+    const until = endDate ? new Date(`${endDate}T23:59:59.999Z`) : new Date();
+
+    const createdAtFilter: any = { gte: since };
+    if (endDate) createdAtFilter.lte = until;
 
     const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
 
-    const orderWhereAffiliate = { affiliate: { userId: req.user.sub }, status: 'APPROVED' as const, createdAt: { gte: since } };
+    const orderWhereAffiliate = { affiliate: { userId: req.user.sub }, status: 'APPROVED' as const, createdAt: createdAtFilter };
     const orderWhereOwn       = producer
-      ? { offer: { product: { producerId: producer.id } }, status: 'APPROVED' as const, createdAt: { gte: since }, affiliateId: null }
+      ? { offer: { product: { producerId: producer.id } }, status: 'APPROVED' as const, createdAt: createdAtFilter, affiliateId: null }
       : null;
 
     const orderWhere =
       filter === 'affiliate' ? orderWhereAffiliate :
       filter === 'own'       ? (orderWhereOwn ?? { id: 'none' }) :
       producer
-        ? { status: 'APPROVED' as const, createdAt: { gte: since }, OR: [
+        ? { status: 'APPROVED' as const, createdAt: createdAtFilter, OR: [
             { affiliate: { userId: req.user.sub } },
             { offer: { product: { producerId: producer.id } } },
           ]}
@@ -466,8 +477,9 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     });
 
     const days: Record<string, { day: string; receita: number; pedidos: number }> = {};
-    for (let i = 13; i >= 0; i--) {
-      const d = new Date();
+    const totalDays = Math.ceil((until.getTime() - since.getTime()) / 86_400_000) + 1;
+    for (let i = totalDays - 1; i >= 0; i--) {
+      const d = new Date(until);
       d.setDate(d.getDate() - i);
       const key = d.toISOString().slice(0, 10);
       days[key] = {
