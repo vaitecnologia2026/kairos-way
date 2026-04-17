@@ -33,12 +33,13 @@ export async function trackingRoutes(app: FastifyInstance) {
     return reply.send({ pixels });
   });
 
-  // ── GET /tracking — listar pixels do produtor logado ─────────────────
+  // ── GET /tracking — listar pixels (admin vê todos, demais veem os seus) ──
   app.get('/', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE', 'ADMIN')],
   }, async (req, reply) => {
+    const where = req.user.role === 'ADMIN' ? {} : { producerId: req.user.sub };
     const pixels = await prisma.trackingPixel.findMany({
-      where  : { producerId: req.user.sub },
+      where,
       orderBy: { createdAt: 'desc' },
     });
     return reply.send(pixels);
@@ -46,7 +47,7 @@ export async function trackingRoutes(app: FastifyInstance) {
 
   // ── POST /tracking — criar pixel ──────────────────────────────────────
   app.post('/', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE', 'ADMIN')],
   }, async (req, reply) => {
     const body = z.object({
       provider: z.enum(PROVIDERS),
@@ -65,13 +66,13 @@ export async function trackingRoutes(app: FastifyInstance) {
 
   // ── PUT /tracking/:id — atualizar pixel ───────────────────────────────
   app.put('/:id', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE', 'ADMIN')],
   }, async (req, reply) => {
     const { id } = req.params as { id: string };
 
     const existing = await prisma.trackingPixel.findUnique({ where: { id } });
-    if (!existing)                            throw new NotFoundError('Pixel');
-    if (existing.producerId !== req.user.sub) throw new ForbiddenError();
+    if (!existing) throw new NotFoundError('Pixel');
+    if (existing.producerId !== req.user.sub && req.user.role !== 'ADMIN') throw new ForbiddenError();
 
     const body = z.object({
       provider: z.enum(PROVIDERS).optional(),
@@ -87,13 +88,13 @@ export async function trackingRoutes(app: FastifyInstance) {
 
   // ── DELETE /tracking/:id ──────────────────────────────────────────────
   app.delete('/:id', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE', 'ADMIN')],
   }, async (req, reply) => {
     const { id } = req.params as { id: string };
 
     const existing = await prisma.trackingPixel.findUnique({ where: { id } });
-    if (!existing)                            throw new NotFoundError('Pixel');
-    if (existing.producerId !== req.user.sub) throw new ForbiddenError();
+    if (!existing) throw new NotFoundError('Pixel');
+    if (existing.producerId !== req.user.sub && req.user.role !== 'ADMIN') throw new ForbiddenError();
 
     await prisma.trackingPixel.delete({ where: { id } });
     return reply.send({ message: 'Pixel removido.' });
