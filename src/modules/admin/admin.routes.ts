@@ -88,24 +88,46 @@ export async function adminRoutes(app: FastifyInstance) {
     return reply.send(producers);
   });
 
-  // GET /admin/settings — configurações da plataforma
+  // GET /admin/settings — configurações da plataforma (persistidas no banco)
   app.get('/settings', { preHandler: [authenticate, requireRole('ADMIN')] }, async (_req, reply) => {
-    return reply.send({
-      platformSpreadBps: 500,
-      minWithdrawCents: 5000,
-      maxAffiliates: 1000,
-    });
+    const rows = await prisma.platformConfig.findMany();
+    const settings: Record<string, any> = {};
+    for (const row of rows) {
+      settings[row.key] = row.value;
+    }
+    return reply.send(settings);
   });
 
-  // POST /admin/settings — salvar configurações
+  // POST /admin/settings — salvar configurações (merge parcial)
   app.post('/settings', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
-    const body = z.object({
-      platformSpreadBps: z.number().int().min(0).max(5000).optional(),
-      minWithdrawCents: z.number().int().positive().optional(),
-    }).parse(req.body);
+    const body = req.body as Record<string, any>;
 
-    await audit.log({ userId: req.user.sub, action: 'SETTINGS_UPDATED', details: body, level: 'HIGH' });
-    return reply.send({ message: 'Configurações salvas', ...body });
+    for (const [key, value] of Object.entries(body)) {
+      await prisma.platformConfig.upsert({
+        where : { key },
+        create: { key, value: value as any },
+        update: { value: value as any },
+      });
+    }
+
+    await audit.log({ userId: req.user.sub, action: 'SETTINGS_UPDATED', details: Object.keys(body), level: 'HIGH' });
+    return reply.send({ message: 'Configurações salvas' });
+  });
+
+  // PATCH /admin/settings — alias do POST (frontend usa PATCH)
+  app.patch('/settings', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const body = req.body as Record<string, any>;
+
+    for (const [key, value] of Object.entries(body)) {
+      await prisma.platformConfig.upsert({
+        where : { key },
+        create: { key, value: value as any },
+        update: { value: value as any },
+      });
+    }
+
+    await audit.log({ userId: req.user.sub, action: 'SETTINGS_UPDATED', details: Object.keys(body), level: 'HIGH' });
+    return reply.send({ message: 'Configurações salvas' });
   });
 
   // ── AMBIENTE DE TESTE ──────────────────────────────────────────

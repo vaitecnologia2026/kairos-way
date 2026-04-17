@@ -27,7 +27,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
     const cep = body.cepDestino.replace(/\D/g, '');
 
     // Tenta Jadlog
-    if (jadlogService.isConfigured()) {
+    if (await jadlogService.isConfigured()) {
       try {
         const opcoes = await jadlogService.simularFreteMultiplo(
           cep,
@@ -66,7 +66,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
       modalidade : z.number().optional(),
     }).parse(req.body);
 
-    if (!jadlogService.isConfigured()) {
+    if (!await jadlogService.isConfigured()) {
       throw new AppError('Jadlog não configurada — adicione JADLOG_TOKEN, JADLOG_COD_CLIENTE, JADLOG_CNPJ e JADLOG_CEP_ORIGEM no .env', 503);
     }
 
@@ -94,18 +94,20 @@ export async function logisticsRoutes(app: FastifyInstance) {
       throw new AppError('Endereço de entrega não encontrado no pedido', 422);
     }
 
-    // Dados do remetente (produtor/empresa)
+    // Dados do remetente — lidos da config Jadlog salva pelo admin
+    const jadlogCfg = await prisma.platformConfig.findUnique({ where: { key: 'jadlog' } });
+    const jc: any   = jadlogCfg?.value || {};
     const remetente = {
-      nome    : process.env.JADLOG_REMETENTE_NOME    || 'Kairos Way',
-      cnpjCpf : process.env.JADLOG_CNPJ              || '',
-      endereco: process.env.JADLOG_REMETENTE_ENDERECO || '',
-      numero  : process.env.JADLOG_REMETENTE_NUMERO   || '',
-      bairro  : process.env.JADLOG_REMETENTE_BAIRRO   || '',
-      cidade  : process.env.JADLOG_REMETENTE_CIDADE   || '',
-      uf      : process.env.JADLOG_REMETENTE_UF       || '',
-      cep     : process.env.JADLOG_CEP_ORIGEM         || '',
-      email   : process.env.JADLOG_REMETENTE_EMAIL    || '',
-      fone    : process.env.JADLOG_REMETENTE_FONE     || '',
+      nome    : jc.remNome     || 'Kairos Way',
+      cnpjCpf : jc.cnpj       || '',
+      endereco: jc.remEndereco || '',
+      numero  : jc.remNumero   || '',
+      bairro  : jc.remBairro   || '',
+      cidade  : jc.remCidade   || '',
+      uf      : jc.remUf       || '',
+      cep     : jc.cepOrigem   || '',
+      email   : jc.remEmail    || '',
+      fone    : jc.remFone     || '',
     };
 
     // Volume estimado — produtor pode configurar no produto futuramente
@@ -241,7 +243,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
     const meta = shipment.metadata as any;
     const jadlogRef = meta?.jadlogShipmentId || meta?.jadlogCodigo;
 
-    if (jadlogRef && jadlogService.isConfigured()) {
+    if (jadlogRef && await jadlogService.isConfigured()) {
       try {
         const tracking = await jadlogService.consultarTracking({
           shipmentId: meta.jadlogShipmentId,

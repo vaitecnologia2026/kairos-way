@@ -1,5 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import { logger } from '../utils/logger';
+import { prisma } from '../utils/prisma';
 
 /**
  * JADLOG SERVICE — Integração completa com a API Jadlog v2.3
@@ -159,59 +160,90 @@ export const JADLOG_MODALIDADES: Record<number, { nome: string; modal: string }>
 // ── Service ────────────────────────────────────────────────────────
 
 export class JadlogService {
-  private readonly api: AxiosInstance;
-  private readonly trackingApi: AxiosInstance;
-  private readonly token: string;
-  private readonly codCliente: string;
-  private readonly contaCorrente: string;
-  private readonly modalidade: number;
-  private readonly cnpj: string;
-  private readonly cepOrigem: string;
+  private _config: any = null;
+  private _configLoadedAt = 0;
 
-  constructor() {
-    this.token          = process.env.JADLOG_TOKEN         || '';
-    this.codCliente     = process.env.JADLOG_COD_CLIENTE   || '';
-    this.contaCorrente  = process.env.JADLOG_CONTA         || '';
-    this.modalidade     = Number(process.env.JADLOG_MODALIDADE) || 3; // .PACKAGE
-    this.cnpj           = process.env.JADLOG_CNPJ          || '';
-    this.cepOrigem      = process.env.JADLOG_CEP_ORIGEM    || '';
+  /**
+   * Carrega config da tabela PlatformConfig (key='jadlog') com cache de 60s,
+   * com fallback ao .env para compatibilidade.
+   */
+  private async getConfig(): Promise<{
+    token: string; codCliente: string; conta: string;
+    modalidade: number; cnpj: string; cepOrigem: string;
+    remNome: string; remEndereco: string; remNumero: string;
+    remBairro: string; remCidade: string; remUf: string;
+    remEmail: string; remFone: string;
+  }> {
+    // Cache de 60s para não bater no banco a cada chamada
+    if (this._config && Date.now() - this._configLoadedAt < 60_000) return this._config;
 
-    this.api = axios.create({
+    try {
+      const row = await prisma.platformConfig.findUnique({ where: { key: 'jadlog' } });
+      if (row?.value && typeof row.value === 'object') {
+        this._config = row.value;
+        this._configLoadedAt = Date.now();
+        return this._config;
+      }
+    } catch { /* fallback to env */ }
+
+    // Fallback: ler do .env
+    this._config = {
+      token      : process.env.JADLOG_TOKEN         || '',
+      codCliente : process.env.JADLOG_COD_CLIENTE   || '',
+      conta      : process.env.JADLOG_CONTA         || '',
+      modalidade : Number(process.env.JADLOG_MODALIDADE) || 3,
+      cnpj       : process.env.JADLOG_CNPJ          || '',
+      cepOrigem  : process.env.JADLOG_CEP_ORIGEM    || '',
+      remNome    : process.env.JADLOG_REMETENTE_NOME || '',
+      remEndereco: process.env.JADLOG_REMETENTE_ENDERECO || '',
+      remNumero  : process.env.JADLOG_REMETENTE_NUMERO || '',
+      remBairro  : process.env.JADLOG_REMETENTE_BAIRRO || '',
+      remCidade  : process.env.JADLOG_REMETENTE_CIDADE || '',
+      remUf      : process.env.JADLOG_REMETENTE_UF || '',
+      remEmail   : process.env.JADLOG_REMETENTE_EMAIL || '',
+      remFone    : process.env.JADLOG_REMETENTE_FONE || '',
+    };
+    this._configLoadedAt = Date.now();
+    return this._config;
+  }
+
+  private createApi(token: string): AxiosInstance {
+    return axios.create({
       baseURL: 'https://www.jadlog.com.br/embarcador/api',
-      headers: {
-        'Content-Type' : 'application/json',
-        'Authorization': this.token,
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': token },
       timeout: 30_000,
     });
+  }
 
-    this.trackingApi = axios.create({
+  private createTrackingApi(token: string): AxiosInstance {
+    return axios.create({
       baseURL: 'https://prd-traffic.jadlogtech.com.br/embarcador/api',
-      headers: {
-        'Content-Type' : 'application/json',
-        'Authorization': this.token,
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': token },
       timeout: 15_000,
     });
   }
 
   /** Verifica se a integração está configurada */
-  isConfigured(): boolean {
-    return !!(this.token && this.codCliente && this.cnpj && this.cepOrigem);
+  async isConfigured(): Promise<boolean> {
+    const c = await this.getConfig();
+    return !!(c.token && c.codCliente && c.cnpj && c.cepOrigem);
   }
 
   // ── INCLUSÃO DE PEDIDO ─────────────────────────────────────────
 
   async incluirPedido(input: JadlogIncluirPedidoInput): Promise<JadlogIncluirPedidoResponse> {
+    const c   = await this.getConfig();
+    const api = this.createApi(c.token);
+
     const payload = {
-      codCliente    : this.codCliente,
+      codCliente    : c.codCliente,
       conteudo      : input.conteudo,
       pedido        : input.pedido,
       totPeso       : input.totPeso,
       totValor      : input.totValor,
       obs           : input.obs || '',
-      modalidade    : input.modalidade ?? this.modalidade,
-      contaCorrente : this.contaCorrente || undefined,
+      modalidade    : input.modalidade ?? c.modalidade,
+      contaCorrente : c.conta || undefined,
       tpColeta      : input.tpColeta || 'K',
       tipoFrete     : input.tipoFrete ?? 0,
       cdPickupDes   : input.cdPickupDes || undefined,
@@ -232,7 +264,7 @@ export class JadlogService {
     };
 
     try {
-      const { data } = await this.api.post<JadlogIncluirPedidoResponse>('/pedido/incluir', payload);
+      const { data } = await api.post<JadlogIncluirPedidoResponse>('/pedido/incluir', payload);
 
       if (data.erro) {
         logger.error({ erro: data.erro, pedido: input.pedido }, 'Jadlog: erro ao incluir pedido');
@@ -253,8 +285,10 @@ export class JadlogService {
   // ── CANCELAMENTO DE PEDIDO ─────────────────────────────────────
 
   async cancelarPedido(params: { codigo?: string; shipmentId?: string }): Promise<{ status: string; erro?: any }> {
+    const c   = await this.getConfig();
+    const api = this.createApi(c.token);
     try {
-      const { data } = await this.api.post('/pedido/cancelar', params);
+      const { data } = await api.post('/pedido/cancelar', params);
       logger.info(params, 'Jadlog: pedido cancelado');
       return data;
     } catch (err: any) {
@@ -275,8 +309,10 @@ export class JadlogService {
     if (params.shipmentId) consulta.shipmentId = params.shipmentId;
     if (params.pedido)     consulta.pedido     = params.pedido;
 
+    const c          = await this.getConfig();
+    const trackApi   = this.createTrackingApi(c.token);
     try {
-      const { data } = await this.trackingApi.post<JadlogTrackingResponse>(
+      const { data } = await trackApi.post<JadlogTrackingResponse>(
         '/tracking/consultar',
         { consulta: [consulta] }
       );
@@ -300,8 +336,10 @@ export class JadlogService {
     if (params.shipmentId) consulta.shipmentId = params.shipmentId;
     if (params.pedido)     consulta.pedido     = params.pedido;
 
+    const c        = await this.getConfig();
+    const trackApi = this.createTrackingApi(c.token);
     try {
-      const { data } = await this.trackingApi.post<JadlogTrackingResponse>(
+      const { data } = await trackApi.post<JadlogTrackingResponse>(
         '/tracking/simples/consultar',
         { consulta: [consulta] }
       );
@@ -315,16 +353,19 @@ export class JadlogService {
   // ── SIMULADOR DE FRETE ─────────────────────────────────────────
 
   async simularFrete(input: JadlogFreteInput): Promise<JadlogFreteResponse> {
+    const c   = await this.getConfig();
+    const api = this.createApi(c.token);
+
     const payload = {
       frete: [{
-        cepori     : input.cepori || this.cepOrigem,
+        cepori     : input.cepori || c.cepOrigem,
         cepdes     : input.cepdes.replace(/\D/g, ''),
         frap       : 'N',
         peso       : input.peso,
-        cnpj       : this.cnpj,
-        conta      : this.contaCorrente || '',
+        cnpj       : c.cnpj,
+        conta      : c.conta || '',
         contrato   : null,
-        modalidade : input.modalidade ?? this.modalidade,
+        modalidade : input.modalidade ?? c.modalidade,
         tpentrega  : input.tpentrega || 'D',
         tpseguro   : 'N',
         vldeclarado: input.vldeclarado,
@@ -333,7 +374,7 @@ export class JadlogService {
     };
 
     try {
-      const { data } = await this.api.post<JadlogFreteResponse>('/frete/valor', payload);
+      const { data } = await api.post<JadlogFreteResponse>('/frete/valor', payload);
 
       if (data.error) {
         logger.warn({ erro: data.error, cepdes: input.cepdes }, 'Jadlog: erro na simulação de frete');
@@ -366,7 +407,7 @@ export class JadlogService {
     for (const mod of modalidades) {
       try {
         const res = await this.simularFrete({
-          cepori     : this.cepOrigem,
+          cepori     : '',
           cepdes,
           peso       : pesoKg,
           vldeclarado: valorDeclarado,
