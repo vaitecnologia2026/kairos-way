@@ -19,15 +19,40 @@ export async function coproducerRoutes(app: FF) {
     return reply.status(201).send(req2);
   });
 
-  // GET /coproducers/requests — produtor vê solicitações dos seus produtos
-  app.get('/requests', { preHandler: [authenticate, requireRole('PRODUCER')] }, async (req, reply) => {
-    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+  // GET /coproducers/requests — produtor vê solicitações dos seus produtos; admin vê todas
+  app.get('/requests', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+    let productIdFilter: string[] | undefined;
+
+    if (req.user.role !== 'ADMIN') {
+      const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+      const products = await prisma.product.findMany({
+        where: { producerId: producer?.id },
+        select: { id: true },
+      });
+      productIdFilter = products.map(p => p.id);
+    }
+
+    const where: any = { status: 'PENDING' };
+    if (productIdFilter !== undefined) where.productId = { in: productIdFilter };
+
     const requests = await prisma.coproducerRequest.findMany({
-      where: { product: { producerId: producer?.id }, status: 'PENDING' },
-      include: { product: { select: { name: true } } },
+      where,
       orderBy: { createdAt: 'desc' },
     });
-    return reply.send(requests);
+
+    // Enrich with product name (no relation defined on model — manual join)
+    const productIds = [...new Set(requests.map((r: any) => r.productId).filter(Boolean))];
+    const products   = productIds.length
+      ? await prisma.product.findMany({ where: { id: { in: productIds as string[] } }, select: { id: true, name: true } })
+      : [];
+    const productMap = Object.fromEntries(products.map(p => [p.id, p]));
+
+    const data = requests.map((r: any) => ({
+      ...r,
+      product: r.productId ? (productMap[r.productId] ?? null) : null,
+    }));
+
+    return reply.send(data);
   });
 
   // POST /coproducers/requests/:id/approve
@@ -63,14 +88,19 @@ export async function coproducerRoutes(app: FF) {
     return reply.send({ message: 'Co-produtor removido do produto' });
   });
 
-  // GET /coproducers — produtor lista co-produtores dos seus produtos
+  // GET /coproducers — produtor lista co-produtores dos seus produtos; admin vê todos
   app.get('/', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
-    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+    let productFilter: any = {};
+
+    if (req.user.role !== 'ADMIN') {
+      const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+      productFilter = { producerId: producer?.id };
+    }
 
     const cpProducts = await prisma.coproducerProduct.findMany({
       where: {
         isActive : true,
-        product  : { producerId: producer?.id },
+        product  : productFilter,
       },
       include: {
         coproducer: {

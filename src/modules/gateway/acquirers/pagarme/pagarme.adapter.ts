@@ -127,11 +127,11 @@ export class PagarmeAdapter implements IAcquirerAdapter {
           card                : { token: input.cardToken },
           billing             : {
             address: {
-              line_1  : '000, Street',
-              zip_code: '01310100',
-              city    : 'Sao Paulo',
-              state   : 'SP',
-              country : 'BR',
+              line_1  : (input.billingAddress as any)?.line_1   || '000, Street',
+              zip_code: (input.billingAddress as any)?.zip_code || '01310100',
+              city    : (input.billingAddress as any)?.city     || 'Sao Paulo',
+              state   : (input.billingAddress as any)?.state    || 'SP',
+              country : (input.billingAddress as any)?.country  || 'BR',
             },
           },
         },

@@ -16,19 +16,22 @@ function pickAutoColor(existingColors: string[]): string {
   return AUTO_COLORS[Math.floor(Math.random() * AUTO_COLORS.length)];
 }
 
+// MANTIDO: schema original preservado integralmente
+// NOVO: campo termsAndConditions adicionado (opcional)
 const milestoneSchema = z.object({
-  name       : z.string().min(1).max(80),
-  color      : z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
-  targetType : z.enum(['VALUE', 'UNITS']).default('VALUE'),
-  targetValue: z.number().int().min(1),
-  reward     : z.string().min(1).max(2000),
-  position   : z.number().int().min(0).optional(),
+  name              : z.string().min(1).max(80),
+  color             : z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+  targetType        : z.enum(['VALUE', 'UNITS']).default('VALUE'),
+  targetValue       : z.number().int().min(1),
+  reward            : z.string().min(1).max(2000),
+  position          : z.number().int().min(0).optional(),
+  termsAndConditions: z.string().max(10000).optional().nullable(), // NOVO
 });
 
 export const milestoneRoutes: FastifyPluginAsync = async (app) => {
 
   // ── GET /producers/milestones ─────────────────────────────────
-  // Lista marcos + progresso atual do produtor
+  // MANTIDO: lógica de progresso e cálculo preservados integralmente
   app.get('/', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
     const userId = req.user.sub;
 
@@ -37,19 +40,23 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
       orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
     });
 
+    // Resolve Producer record ID (Product.producerId stores Producer.id, not User.id)
+    const producerRecord = await prisma.producer.findUnique({ where: { userId }, select: { id: true } });
+    const producerRecordId = producerRecord?.id ?? userId;
+
     // Calcula progresso: soma de vendas APPROVED dos produtos do produtor
     const [valueSales, unitSales] = await Promise.all([
       prisma.order.aggregate({
         _sum : { amountCents: true },
         where: {
           status: 'APPROVED',
-          offer : { product: { producerId: userId } },
+          offer : { product: { producerId: producerRecordId } },
         },
       }),
       prisma.order.count({
         where: {
           status: 'APPROVED',
-          offer : { product: { producerId: userId } },
+          offer : { product: { producerId: producerRecordId } },
         },
       }),
     ]);
@@ -71,6 +78,8 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── POST /producers/milestones ────────────────────────────────
+  // MANTIDO: lógica de cor automática e posição automática preservadas
+  // NOVO: persiste termsAndConditions
   app.post('/', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
     const userId = req.user.sub;
     const body   = milestoneSchema.parse(req.body);
@@ -98,13 +107,14 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
 
     const milestone = await prisma.salesMilestone.create({
       data: {
-        producerId : userId,
-        name       : body.name,
+        producerId        : userId,
+        name              : body.name,
         color,
-        targetType : body.targetType,
-        targetValue: body.targetValue,
-        reward     : body.reward,
+        targetType        : body.targetType,
+        targetValue       : body.targetValue,
+        reward            : body.reward,
         position,
+        termsAndConditions: body.termsAndConditions ?? null, // NOVO
       },
     });
 
@@ -112,6 +122,8 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── PUT /producers/milestones/:id ─────────────────────────────
+  // MANTIDO: toda a lógica de atualização parcial preservada
+  // NOVO: permite atualizar termsAndConditions
   app.put('/:id', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
     const userId = req.user.sub;
     const { id } = req.params as { id: string };
@@ -135,12 +147,13 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
     const updated = await prisma.salesMilestone.update({
       where: { id },
       data : {
-        ...(body.name        !== undefined && { name       : body.name }),
-        ...(color            !== undefined && { color }),
-        ...(body.targetType  !== undefined && { targetType : body.targetType }),
-        ...(body.targetValue !== undefined && { targetValue: body.targetValue }),
-        ...(body.reward      !== undefined && { reward     : body.reward }),
-        ...(body.position    !== undefined && { position   : body.position }),
+        ...(body.name               !== undefined && { name              : body.name }),
+        ...(color                   !== undefined && { color }),
+        ...(body.targetType         !== undefined && { targetType        : body.targetType }),
+        ...(body.targetValue        !== undefined && { targetValue       : body.targetValue }),
+        ...(body.reward             !== undefined && { reward            : body.reward }),
+        ...(body.position           !== undefined && { position          : body.position }),
+        ...(body.termsAndConditions !== undefined && { termsAndConditions: body.termsAndConditions ?? null }), // NOVO
       },
     });
 
@@ -148,6 +161,7 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── DELETE /producers/milestones/:id ──────────────────────────
+  // MANTIDO: preservado integralmente
   app.delete('/:id', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
     const userId = req.user.sub;
     const { id } = req.params as { id: string };
@@ -163,7 +177,7 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── PUT /producers/milestones/reorder ─────────────────────────
-  // Recebe array de { id, position } para reordenar em lote
+  // MANTIDO: preservado integralmente
   app.put('/reorder', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
     const userId = req.user.sub;
     const { items } = z.object({
@@ -180,5 +194,45 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
     );
 
     return reply.send({ ok: true });
+  });
+
+  // ── POST /producers/milestones/:id/join ───────────────────────
+  // NOVO: afiliado aceita termos e ingressa no marco
+  app.post('/:id/join', { preHandler: [authenticate, requireRole('AFFILIATE')] }, async (req, reply) => {
+    const userId = (req.user as any).sub as string;
+    const { id } = req.params as { id: string };
+
+    // Valida que o marco existe
+    const milestone = await prisma.salesMilestone.findUnique({ where: { id } });
+    if (!milestone) throw new AppError('Marco não encontrado', 404);
+
+    // Resolve o Affiliate record do usuário logado
+    const affiliate = await prisma.affiliate.findUnique({ where: { userId } });
+    if (!affiliate) throw new AppError('Perfil de afiliado não encontrado', 404);
+
+    // Cria o enrollment (ignora se já existe — upsert pelo unique constraint)
+    await prisma.milestoneEnrollment.upsert({
+      where : { milestoneId_affiliateId: { milestoneId: id, affiliateId: affiliate.id } },
+      create: { milestoneId: id, affiliateId: affiliate.id },
+      update: {},   // já inscrito — não faz nada
+    });
+
+    return reply.status(201).send({ ok: true });
+  });
+
+  // ── GET /producers/milestones/:id/enrollment ──────────────────
+  // NOVO: retorna se o afiliado logado está inscrito no marco
+  app.get('/:id/enrollment', { preHandler: [authenticate] }, async (req, reply) => {
+    const userId = (req.user as any).sub as string;
+    const { id } = req.params as { id: string };
+
+    const affiliate = await prisma.affiliate.findUnique({ where: { userId } });
+    if (!affiliate) return reply.send({ enrolled: false });
+
+    const enrollment = await prisma.milestoneEnrollment.findUnique({
+      where: { milestoneId_affiliateId: { milestoneId: id, affiliateId: affiliate.id } },
+    });
+
+    return reply.send({ enrolled: !!enrollment, acceptedAt: enrollment?.acceptedAt ?? null });
   });
 };

@@ -5,6 +5,7 @@ import { redisConnection } from '../utils/redis';
 import { prisma } from '../utils/prisma';
 import { logger } from '../utils/logger';
 import { GatewayService } from '../../modules/gateway/gateway.service';
+import { SplitEngineService } from '../../modules/split-engine/split-engine.service';
 import { EmailService } from '../services/email.service';
 import { NFeIoService } from '../services/nfeio.service';
 import {
@@ -15,16 +16,29 @@ import {
   nfeQueue,
   logisticsQueue,
 } from './queues';
-import { enqueueEmail } from './enqueue';
+import { enqueueEmail, dispatchWebhookEvent } from './enqueue';
+import { notifyNewSale } from '../utils/notifyNewSale';
 
-
-
-const gateway  = new GatewayService();
-const emailSvc = new EmailService();
-const nfeIo    = new NFeIoService();
+const gateway     = new GatewayService();
+const splitEngine = new SplitEngineService();
+const emailSvc    = new EmailService();
+const nfeIo       = new NFeIoService();
 
 // FIX B-68: referências persistidas — GC não pode coletar os workers
 const workers: Worker[] = [];
+
+// Intervalo do job de reconciliação (2 minutos)
+const RECONCILIATION_INTERVAL_MS = 2 * 60 * 1_000;
+
+// Status Pagar.me → status interno
+const PAGARME_STATUS_MAP: Record<string, string> = {
+  paid        : 'APPROVED',
+  authorized  : 'APPROVED',
+  refunded    : 'REFUNDED',
+  chargedback : 'CHARGEBACK',
+  canceled    : 'REJECTED',
+  failed      : 'REJECTED',
+};
 
 export async function startWorkers() {
   workers.push(
@@ -36,11 +50,128 @@ export async function startWorkers() {
     startLogisticsWorker(),
   );
   logger.info(`✅ ${workers.length} Workers BullMQ iniciados`);
+
+  // Job de reconciliação — roda imediatamente e depois a cada 2 min
+  runReconciliation().catch((err) => logger.error({ err }, 'Reconciliação: erro na primeira execução'));
+  setInterval(() => {
+    runReconciliation().catch((err) => logger.error({ err }, 'Reconciliação: erro inesperado'));
+  }, RECONCILIATION_INTERVAL_MS);
+
+  logger.info('✅ Job de reconciliação de pagamentos iniciado (intervalo: 2 min)');
 }
 
 export async function stopWorkers() {
   await Promise.all(workers.map((w) => w.close()));
   logger.info('Workers BullMQ encerrados');
+}
+
+// ── RECONCILIAÇÃO DE PAGAMENTOS ───────────────────────────────────
+/**
+ * Verifica pedidos PROCESSING diretamente no adquirente e os aprova
+ * automaticamente caso o pagamento tenha sido confirmado (ex: PIX pago
+ * mas webhook não chegou ou chegou com estrutura inesperada).
+ *
+ * Roda a cada 2 minutos via setInterval.
+ */
+async function runReconciliation(): Promise<void> {
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1_000); // últimas 24h
+  const after  = new Date(Date.now() - 2 * 60 * 1_000);       // criado há mais de 2 min (evita race com checkout)
+
+  const pendingOrders = await prisma.order.findMany({
+    where: {
+      status      : 'PROCESSING',
+      acquirerTxId: { not: null },
+      createdAt   : { gte: since, lte: after },
+    },
+    select: { id: true, acquirer: true, acquirerTxId: true, amountCents: true },
+    take: 50, // processa no máximo 50 por rodada para não sobrecarregar a API
+  });
+
+  if (pendingOrders.length === 0) return;
+
+  logger.info({ count: pendingOrders.length }, 'Reconciliação: verificando pedidos PROCESSING');
+
+  for (const order of pendingOrders) {
+    try {
+      const rawStatus = await gateway.getStatus(order.acquirer as any, order.acquirerTxId!);
+      const newStatus  = PAGARME_STATUS_MAP[rawStatus];
+
+      if (!newStatus) continue; // still pending/waiting — nenhuma ação
+
+      // Recarregar para garantir idempotência (pode ter sido aprovado por webhook entre os checks)
+      const current = await prisma.order.findUnique({ where: { id: order.id }, select: { status: true } });
+      if (!current || current.status !== 'PROCESSING') continue;
+
+      logger.info({ orderId: order.id, rawStatus, newStatus }, 'Reconciliação: atualizando status do pedido');
+
+      await prisma.order.update({
+        where: { id: order.id },
+        data : {
+          status    : newStatus as any,
+          approvedAt: newStatus === 'APPROVED' ? new Date() : undefined,
+        },
+      });
+
+      if (newStatus === 'APPROVED') {
+        await aprovarPedidoReconciliacao(order.id);
+        await dispatchWebhookEvent('payment.approved', { orderId: order.id, acquirer: order.acquirer, amountCents: order.amountCents });
+      }
+
+    } catch (err: any) {
+      // Falha em um pedido não deve parar os demais
+      logger.warn({ orderId: order.id, err: err.message }, 'Reconciliação: erro ao verificar pedido');
+    }
+  }
+}
+
+/**
+ * Cria splits e notifica após aprovação pela reconciliação.
+ * Idempotente — não duplica splits se já existirem.
+ */
+async function aprovarPedidoReconciliacao(orderId: string): Promise<void> {
+  const existing = await prisma.splitRecord.count({ where: { orderId } });
+  if (existing > 0) return;
+
+  const order = await prisma.order.findUnique({
+    where  : { id: orderId },
+    include: { offer: { include: { product: true } } },
+  });
+  if (!order?.offer) return;
+
+  const producerUserId = order.offer.product.producerId;
+  const splits         = await splitEngine.calculate(order.offer.id, order.amountCents);
+  await splitEngine.saveSplitRecords(orderId, splits);
+
+  let affiliateUserId: string | undefined;
+  let commissionCents = 0;
+
+  if (order.affiliateId) {
+    const [affiliate, config] = await Promise.all([
+      prisma.affiliate.findUnique({ where: { id: order.affiliateId } }),
+      prisma.affiliateConfig.findUnique({ where: { offerId: order.offer.id, enabled: true } }),
+    ]);
+
+    if (affiliate && config && config.commissionBps > 0) {
+      commissionCents = Math.floor(order.amountCents * config.commissionBps / 10000);
+      if (commissionCents > 0) {
+        const producerRecord = await prisma.splitRecord.findFirst({ where: { orderId, recipientType: 'PRODUCER' } });
+        if (producerRecord && producerRecord.amountCents >= commissionCents) {
+          await prisma.$transaction([
+            prisma.splitRecord.update({ where: { id: producerRecord.id }, data: { amountCents: producerRecord.amountCents - commissionCents } }),
+            prisma.splitRecord.create({ data: { orderId, splitRuleId: producerRecord.splitRuleId, recipientType: 'AFFILIATE', recipientId: affiliate.userId, amountCents: commissionCents, status: 'PENDING' } }),
+          ]);
+          affiliateUserId = affiliate.userId;
+        }
+        await prisma.affiliateTracking.updateMany({
+          where: { affiliateId: order.affiliateId, offerId: order.offer.id, orderId: null },
+          data : { orderId },
+        });
+      }
+    }
+  }
+
+  await notifyNewSale({ orderId, productName: order.offer.product.name, amountCents: order.amountCents, producerUserId, affiliateUserId, commissionCents });
+  logger.info({ orderId }, 'Reconciliação: splits criados e produtor notificado');
 }
 
 // ── WEBHOOK WORKER ────────────────────────────────────────────────

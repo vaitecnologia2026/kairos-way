@@ -65,6 +65,35 @@ export async function producerRoutes(app: FastifyInstance) {
     return reply.send({ kycStatus: producer.kycStatus, documents: producer.kycDocuments });
   });
 
+  // ── GET /producers/checkout-config ───────────────────────────────
+  app.get('/checkout-config', { preHandler: [authenticate, requireRole('PRODUCER')] }, async (req, reply) => {
+    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+    if (!producer) throw new NotFoundError('Produtor');
+    const cfg = (producer.metadata as any)?.successConfig ?? {};
+    return reply.send({ html: cfg.html ?? '', icon: cfg.icon ?? 'CheckCircle', color: cfg.color ?? '#00C9A7' });
+  });
+
+  // ── PATCH /producers/checkout-config ─────────────────────────────
+  app.patch('/checkout-config', { preHandler: [authenticate, requireRole('PRODUCER')] }, async (req, reply) => {
+    const body = z.object({
+      html : z.string().max(20000).optional().nullable(),
+      icon : z.string().max(50).optional().nullable(),
+      color: z.string().max(20).optional().nullable(),
+    }).parse(req.body);
+
+    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+    if (!producer) throw new NotFoundError('Produtor');
+
+    const currentMeta = (producer.metadata as any) ?? {};
+    await prisma.producer.update({
+      where: { userId: req.user.sub },
+      data : { metadata: { ...currentMeta, successConfig: body } },
+    });
+
+    await auditService.log({ userId: req.user.sub, action: 'CHECKOUT_CONFIG_UPDATED', level: 'LOW' });
+    return reply.send({ message: 'Configuração salva' });
+  });
+
   // ── GET /producers/dashboard ──────────────────────────────────
   app.get('/dashboard', {
     preHandler: [authenticate, requireRole('PRODUCER')],

@@ -23,13 +23,18 @@ export async function checkoutRoutes(app: FastifyInstance) {
     const q    = req.query  as { aff?: string; ref?: string };
     const aff   = q.aff || q.ref;
 
-    const offer = await prisma.offer.findUnique({
-      where  : { slug, isActive: true, deletedAt: null },
-      include: {
-        product      : { select: { name: true, description: true, imageUrl: true, type: true, digitalUrl: true } },
-        checkoutConfig: true,
-      },
-    });
+    const [offer, platformConfig] = await Promise.all([
+      prisma.offer.findUnique({
+        where  : { slug, isActive: true, deletedAt: null },
+        include: {
+          product: {
+            include: { producer: { select: { metadata: true } } },
+          },
+          checkoutConfig: true,
+        },
+      }),
+      prisma.platformConfig.findUnique({ where: { key: 'checkout_success_message' } }),
+    ]);
     if (!offer) throw new NotFoundError('Oferta');
 
     // Rastrear clique de afiliado (fire-and-forget)
@@ -43,14 +48,24 @@ export async function checkoutRoutes(app: FastifyInstance) {
       }).catch(() => {});
     }
 
+    // Hierarquia: produto → produtor → plataforma → código
+    const prodCfg  = ((offer.product as any).producer?.metadata as any)?.successConfig ?? {};
+    const platCfg  = (platformConfig?.value as any) ?? {};
+    const successMessage   = offer.product.successMessage   ?? prodCfg.html  ?? platCfg.html  ?? null;
+    const successIcon      = offer.product.successIcon      ?? prodCfg.icon  ?? platCfg.icon  ?? 'CheckCircle';
+    const successIconColor = offer.product.successIconColor ?? prodCfg.color ?? platCfg.color ?? '#00C9A7';
+
     return reply.send({
       offer: {
-        id         : offer.id,
-        name       : offer.product.name,
-        description: offer.product.description,
-        imageUrl   : offer.product.imageUrl,
-        priceCents : offer.priceCents,
-        type       : offer.type,
+        id              : offer.id,
+        name            : offer.product.name,
+        description     : offer.product.description,
+        imageUrl        : offer.product.imageUrl,
+        priceCents      : offer.priceCents,
+        type            : offer.type,
+        successMessage,
+        successIcon,
+        successIconColor,
       },
       config: offer.checkoutConfig,
     });

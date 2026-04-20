@@ -273,10 +273,13 @@ model Product {
   approvedBy   String?
   rejectedAt   DateTime?
   rejectedReason String?
-  metadata     Json?
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  deletedAt    DateTime?
+  metadata          Json?
+  successMessage    String?    @db.Text
+  successIcon       String?
+  successIconColor  String?
+  createdAt         DateTime   @default(now())
+  updatedAt      DateTime      @updatedAt
+  deletedAt      DateTime?
 
   producer     Producer             @relation(fields: [producerId], references: [id])
   offers       Offer[]
@@ -734,18 +737,34 @@ model FunnelGoal {
 }
 
 model SalesMilestone {
-  id          String   @id @default(cuid())
-  producerId  String                        // User.id do produtor
-  name        String
-  color       String                        // hex, atribuída automaticamente se não fornecida
-  targetType  String   @default("VALUE")    // "VALUE" | "UNITS"
-  targetValue Int                           // centavos se VALUE, quantidade se UNITS
-  reward      String   @db.Text
-  position    Int      @default(0)          // ordem exibição
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id                 String   @id @default(cuid())
+  producerId         String                        // User.id do produtor
+  name               String
+  color              String                        // hex, atribuída automaticamente se não fornecida
+  targetType         String   @default("VALUE")    // "VALUE" | "UNITS"
+  targetValue        Int                           // centavos se VALUE, quantidade se UNITS
+  reward             String   @db.Text
+  termsAndConditions String?  @db.Text             // NOVO: termos e condições do marco
+  position           Int      @default(0)          // ordem exibição
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  enrollments MilestoneEnrollment[] // NOVO: afiliados inscritos
 
   @@index([producerId])
+}
+
+// NOVO: registro de adesão do afiliado ao marco (aceite de termos)
+model MilestoneEnrollment {
+  id          String   @id @default(cuid())
+  milestoneId String
+  affiliateId String                        // Affiliate.id
+  acceptedAt  DateTime @default(now())
+
+  milestone SalesMilestone @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+
+  @@unique([milestoneId, affiliateId])
+  @@index([affiliateId])
 }
 
 model ReferralProgram {

@@ -501,6 +501,8 @@ export async function affiliatesRoutes(app: FastifyInstance) {
   });
 
   // GET /affiliates/milestones — marcos de todos os produtores + progresso do afiliado
+  // MANTIDO: toda a lógica de agrupamento, progresso e cálculo preservada
+  // NOVO: inclui termsAndConditions e isEnrolled em cada milestone
   app.get('/milestones', { preHandler: [authenticate] }, async (req, reply) => {
     const userId = (req.user as any).sub as string;
 
@@ -513,6 +515,13 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     });
 
     if (allMilestones.length === 0) return reply.send({ data: [] });
+
+    // NOVO: busca todos os enrollments do afiliado de uma vez (evita N+1)
+    const enrollments = await prisma.milestoneEnrollment.findMany({
+      where : { affiliateId: affiliate.id },
+      select: { milestoneId: true, acceptedAt: true },
+    });
+    const enrolledMap = new Map(enrollments.map(e => [e.milestoneId, e.acceptedAt]));
 
     // Agrupa por producerId
     const byProducer = new Map<string, typeof allMilestones>();
@@ -559,7 +568,15 @@ export async function affiliatesRoutes(app: FastifyInstance) {
           const current    = m.targetType === 'VALUE' ? totalValueCents : totalUnits;
           const percentage = Math.min(100, Math.round((current / m.targetValue) * 100));
           const reached    = current >= m.targetValue;
-          return { ...m, current, percentage, reached };
+          // NOVO: enriquece com dados de termos e status de inscrição
+          return {
+            ...m,
+            current,
+            percentage,
+            reached,
+            isEnrolled : enrolledMap.has(m.id),
+            acceptedAt : enrolledMap.get(m.id) ?? null,
+          };
         });
 
         return {

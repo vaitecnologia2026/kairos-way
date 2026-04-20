@@ -60,6 +60,28 @@ export async function productRoutes(app: FastifyInstance) {
     return reply.send({ data, total, page: Number(page), limit: Number(limit) });
   });
 
+  // NOVO: GET /products/admin/all — lista todos os produtos para o admin (com filtro de status)
+  // BUG 1 CORRIGIDO: frontend admin chama esta rota — ela não existia
+  app.get('/admin/all', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { page = '1', limit = '20', status } = req.query as any;
+    const skip = (Number(page) - 1) * Number(limit);
+
+    const [data, total] = await Promise.all([
+      prisma.product.findMany({
+        where: { status: status || undefined, deletedAt: null },
+        include: {
+          offers  : { where: { isActive: true }, select: { id: true, name: true, priceCents: true, slug: true, type: true } },
+          producer: { include: { user: { select: { name: true, email: true } } } },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip, take: Number(limit),
+      }),
+      prisma.product.count({ where: { status: status || undefined, deletedAt: null } }),
+    ]);
+
+    return reply.send({ data, total, page: Number(page), limit: Number(limit) });
+  });
+
   // GET /products/:id
   app.get('/:id', { preHandler: [authenticate] }, async (req, reply) => {
     const { id } = req.params as { id: string };
@@ -78,11 +100,14 @@ export async function productRoutes(app: FastifyInstance) {
   app.patch('/:id', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = z.object({
-      name: z.string().optional(),
-      description: z.string().optional(),
-      imageUrl: z.string().url().optional(),
-      category: z.string().optional(),
-      isActive: z.boolean().optional(),
+      name             : z.string().optional(),
+      description      : z.string().optional(),
+      imageUrl         : z.string().url().optional(),
+      category         : z.string().optional(),
+      isActive         : z.boolean().optional(),
+      successMessage   : z.string().max(20000).optional().nullable(),
+      successIcon      : z.string().max(50).optional().nullable(),
+      successIconColor : z.string().max(20).optional().nullable(),
     }).parse(req.body);
 
     const product = await prisma.product.update({
@@ -117,8 +142,16 @@ export async function productRoutes(app: FastifyInstance) {
   });
 
   // POST /products/:id/approve (admin)
+  // BUG 3 CORRIGIDO: guard de estado — só aprova produto em status PENDING ou REVIEW
   app.post('/:id/approve', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
     const { id } = req.params as { id: string };
+
+    const existing = await prisma.product.findUnique({ where: { id } });
+    if (!existing) throw new AppError('Produto não encontrado', 404);
+    if (!['PENDING', 'REVIEW'].includes(existing.status)) {
+      throw new AppError(`Produto não pode ser aprovado pois está com status "${existing.status}"`, 409);
+    }
+
     const product = await prisma.product.update({
       where: { id },
       data: { status: 'APPROVED', approvedAt: new Date(), approvedBy: req.user.sub },
@@ -128,12 +161,25 @@ export async function productRoutes(app: FastifyInstance) {
   });
 
   // POST /products/:id/reject (admin)
+  // BUG 2 CORRIGIDO: validação Zod retornava 500 — agora captura e retorna 400
+  // BUG 3 CORRIGIDO: guard de estado — só rejeita produto em status PENDING ou REVIEW
   app.post('/:id/reject', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
     const { id } = req.params as { id: string };
-    const body = z.object({ reason: z.string().min(5) }).parse(req.body);
+
+    const parsed = z.object({ reason: z.string().min(5) }).safeParse(req.body);
+    if (!parsed.success) {
+      throw new AppError('O motivo da rejeição deve ter pelo menos 5 caracteres', 400);
+    }
+
+    const existing = await prisma.product.findUnique({ where: { id } });
+    if (!existing) throw new AppError('Produto não encontrado', 404);
+    if (!['PENDING', 'REVIEW'].includes(existing.status)) {
+      throw new AppError(`Produto não pode ser rejeitado pois está com status "${existing.status}"`, 409);
+    }
+
     await prisma.product.update({
       where: { id },
-      data: { status: 'REJECTED', rejectedAt: new Date(), rejectedReason: body.reason },
+      data: { status: 'REJECTED', rejectedAt: new Date(), rejectedReason: parsed.data.reason },
     });
     await auditService.log({ userId: req.user.sub, action: 'PRODUCT_REJECTED', resource: `product:${id}`, level: 'MEDIUM' });
     return reply.send({ message: 'Produto rejeitado' });

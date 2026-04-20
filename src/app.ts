@@ -76,6 +76,21 @@ async function bootstrap() {
 
   await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
 
+  // ── RAW BODY CAPTURE (para HMAC de webhooks) ─────────────────
+  // Captura o payload original antes do parse JSON para validação de assinatura.
+  // Sem isso, JSON.stringify(req.body) pode diferir do payload que o adquirente assinou.
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
+    (req as any).rawBody = body as string;
+    const str = (body as string || '').trim();
+    if (!str) { done(null, {}); return; }
+    try {
+      done(null, JSON.parse(str));
+    } catch (err: any) {
+      err.statusCode = 400;
+      done(err);
+    }
+  });
+
   // ── GLOBAL ERROR HANDLER ─────────────────────────────────────
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof AppError) {

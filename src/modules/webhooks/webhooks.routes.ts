@@ -346,22 +346,57 @@ export async function webhookRoutes(app: FastifyInstance) {
 
 // ── PROCESSADORES POR ADQUIRENTE ─────────────────────────────────
 
+/**
+ * Processa eventos Pagar.me V5.
+ *
+ * Pagar.me envia eventos de dois níveis distintos:
+ *   - charge.*  → data.id é o ID da charge (ch_xxx)   ← acquirerTxId no banco
+ *   - order.*   → data.id é o ID do order (or_xxx) e as charges ficam em data.charges[]
+ *
+ * O banco armazena o ID da CHARGE (ch_xxx). Para eventos de nível order precisamos
+ * extrair o ID da charge do array data.charges antes de fazer o lookup.
+ */
 async function processPagarmeWebhook(payload: any) {
-  const txId   = payload.data?.id;
-  const status = payload.data?.status;
-  if (!txId || !status) return;
+  const eventType: string = payload.type || '';
+  let txId: string | undefined;
+  let status: string | undefined;
 
-  // Pagar.me V5: charge events
+  if (eventType.startsWith('order.')) {
+    // Evento de nível order — extrair charge ID de data.charges[0]
+    const charges: any[] = payload.data?.charges || [];
+    if (charges.length === 0) {
+      logger.warn({ eventType, orderId: payload.data?.id }, 'Pagar.me: order.* sem charges — ignorado');
+      return;
+    }
+    const charge = charges[0];
+    txId   = charge.id;
+    status = charge.status ?? payload.data?.status;
+  } else {
+    // Evento de nível charge (charge.paid, charge.refunded, etc.)
+    txId   = payload.data?.id;
+    status = payload.data?.status;
+  }
+
+  if (!txId || !status) {
+    logger.warn({ eventType, payload: JSON.stringify(payload).slice(0, 200) }, 'Pagar.me webhook: payload sem txId ou status');
+    return;
+  }
+
   const orderStatus =
     status === 'paid'        ? 'APPROVED'   :
     status === 'refunded'    ? 'REFUNDED'   :
-    status === 'chargedback' ? 'CHARGEBACK' : null;
+    status === 'chargedback' ? 'CHARGEBACK' :
+    status === 'canceled'    ? 'REJECTED'   :
+    status === 'failed'      ? 'REJECTED'   : null;
 
-  if (!orderStatus) return;
+  if (!orderStatus) {
+    logger.info({ txId, status, eventType }, 'Pagar.me webhook: status sem ação mapeada — ignorado');
+    return;
+  }
 
   const order = await prisma.order.findFirst({ where: { acquirerTxId: txId } });
   if (!order) {
-    logger.warn({ txId, status }, 'Pagar.me webhook: pedido não encontrado');
+    logger.warn({ txId, status, eventType }, 'Pagar.me webhook: pedido não encontrado pelo acquirerTxId');
     return;
   }
 
@@ -370,6 +405,8 @@ async function processPagarmeWebhook(payload: any) {
     logger.info({ txId, orderStatus }, 'Pagar.me webhook: status já atualizado, ignorando');
     return;
   }
+
+  logger.info({ orderId: order.id, txId, prevStatus: order.status, newStatus: orderStatus, eventType }, 'Pagar.me webhook: atualizando status do pedido');
 
   await prisma.order.update({
     where: { id: order.id },

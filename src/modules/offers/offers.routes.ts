@@ -52,16 +52,23 @@ export async function offerRoutes(app: FastifyInstance) {
   // GET /offers/by-slug/:slug (público — checkout)
   app.get('/by-slug/:slug', async (req, reply) => {
     const { slug } = req.params as { slug: string };
-    const offer = await prisma.offer.findUnique({
-      where: { slug, isActive: true },
-      include: {
-        product: { select: { name: true, description: true, imageUrl: true, type: true } },
-        splitRules: { where: { isActive: true } },
-        checkoutConfig: true,
-      },
-    });
+    const [offer, platformConfig] = await Promise.all([
+      prisma.offer.findUnique({
+        where: { slug, isActive: true },
+        include: {
+          product: { select: { name: true, description: true, imageUrl: true, type: true, successMessage: true } },
+          splitRules: { where: { isActive: true } },
+          checkoutConfig: true,
+        },
+      }),
+      prisma.platformConfig.findUnique({ where: { key: 'checkout_success_message' } }),
+    ]);
     if (!offer) throw new NotFoundError('Oferta');
-    return reply.send(offer);
+
+    const platformMsg = (platformConfig?.value as any)?.html ?? null;
+    const successMessage = offer.product.successMessage ?? platformMsg;
+
+    return reply.send({ ...offer, successMessage });
   });
 
   // PUT /offers/:id (atualiza — inativa antiga, cria nova versão de splits)

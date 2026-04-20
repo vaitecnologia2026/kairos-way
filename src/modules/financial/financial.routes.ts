@@ -7,6 +7,7 @@ import { prisma } from '../../shared/utils/prisma';
 import { AppError } from '../../shared/errors/AppError';
 import { logger } from '../../shared/utils/logger';
 import { whatsAppService } from '../../shared/services/whatsapp.service';
+import { Resend } from 'resend';
 
 const splitEngine = new SplitEngineService();
 const audit = new AuditService();
@@ -119,7 +120,7 @@ export async function financialRoutes(app: FastifyInstance) {
     // Marcar como PAID
     await prisma.withdrawal.update({
       where: { id },
-      data : { status: 'PAID', paidAt: new Date() },
+      data : { status: 'PAID', processedAt: new Date() },
     });
 
     logger.info({ withdrawalId: id, amountCents: withdrawal.amountCents, pixKey: withdrawal.pixKey, processedBy: req.user.sub }, 'Financial: saque confirmado como PAID');
@@ -132,7 +133,6 @@ export async function financialRoutes(app: FastifyInstance) {
 
     // Email de confirmação
     try {
-      const { Resend } = require('resend');
       const resend = new Resend(process.env.RESEND_API_KEY);
       await resend.emails.send({
         from   : `${process.env.EMAIL_FROM_NAME || 'Kairos Way'} <${process.env.EMAIL_FROM || 'onboarding@resend.dev'}>`,
@@ -269,7 +269,7 @@ export async function financialRoutes(app: FastifyInstance) {
     // Marcar todos como PAID
     const result = await prisma.splitRecord.updateMany({
       where: { id: { in: pending.map(p => p.id) }, status: 'PENDING' },
-      data : { status: 'PAID', paidAt: new Date() },
+      data : { status: 'PAID', processedAt: new Date() },
     });
 
     await audit.log({
