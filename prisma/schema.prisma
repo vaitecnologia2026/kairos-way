@@ -229,6 +229,7 @@ model Producer {
   rejectedAt    DateTime?
   rejectedBy    String?
   rejectedReason String?
+  customFeeBps  Int?      // taxa personalizada em basis points (null = usa taxa geral)
   metadata      Json?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
@@ -455,6 +456,7 @@ model Affiliate {
   rejectedAt   DateTime?
   rejectedReason String?
   canCreateProducts Boolean @default(false)
+  customFeeBps Int?      // taxa personalizada em basis points (null = usa taxa geral)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

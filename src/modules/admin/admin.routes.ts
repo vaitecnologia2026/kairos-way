@@ -130,6 +130,157 @@ export async function adminRoutes(app: FastifyInstance) {
     return reply.send({ message: 'Configurações salvas' });
   });
 
+  // ══════════════════════════════════════════════════════════════════
+  // TAXAS E COMISSÕES
+  // ══════════════════════════════════════════════════════════════════
+  // Armazenadas em PlatformConfig com as keys:
+  //   fees.platform            → taxa geral da plataforma (bps)
+  //   fees.acquirer.PAGARME    → taxa cobrada pelo Pagar.me (bps)
+  //   fees.acquirer.STONE      → taxa cobrada pelo Stone (bps)
+  //   fees.acquirer.ASAAS      → taxa cobrada pelo Asaas (bps)
+  //   fees.acquirer.CIELO      → taxa cobrada pela Cielo (bps)
+  //
+  // Taxas personalizadas ficam em Producer.customFeeBps / Affiliate.customFeeBps
+  // (null = usa a taxa geral)
+  //
+  // Lucro da plataforma = taxa plataforma (cobrada do usuário) − taxa adquirente
+
+  const ACQUIRERS = ['PAGARME', 'STONE', 'ASAAS', 'CIELO'] as const;
+
+  // GET /admin/fees — retorna taxa geral, por adquirente e cálculo de lucro
+  app.get('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (_req, reply) => {
+    const rows = await prisma.platformConfig.findMany({
+      where: { key: { startsWith: 'fees.' } },
+    });
+
+    const map: Record<string, any> = {};
+    for (const r of rows) map[r.key] = (r.value as any)?.bps ?? 0;
+
+    const platformBps = map['fees.platform'] ?? 0;
+    const acquirers: Record<string, { bps: number; profitBps: number }> = {};
+    for (const acq of ACQUIRERS) {
+      const acqBps = map[`fees.acquirer.${acq}`] ?? 0;
+      acquirers[acq] = {
+        bps      : acqBps,
+        profitBps: platformBps - acqBps, // pode ser negativo se acquirer > platform
+      };
+    }
+
+    return reply.send({
+      platformBps,
+      platformPct: platformBps / 100,
+      acquirers,
+    });
+  });
+
+  // POST /admin/fees — atualiza taxa geral e/ou taxas dos adquirentes
+  app.post('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const body = z.object({
+      platformBps: z.number().int().min(0).max(10000).optional(),
+      acquirers  : z.record(z.enum(ACQUIRERS), z.number().int().min(0).max(10000)).optional(),
+    }).parse(req.body);
+
+    const ops: any[] = [];
+
+    if (body.platformBps !== undefined) {
+      ops.push(prisma.platformConfig.upsert({
+        where : { key: 'fees.platform' },
+        create: { key: 'fees.platform', value: { bps: body.platformBps } },
+        update: { value: { bps: body.platformBps } },
+      }));
+    }
+
+    if (body.acquirers) {
+      for (const [acq, bps] of Object.entries(body.acquirers)) {
+        const key = `fees.acquirer.${acq}`;
+        ops.push(prisma.platformConfig.upsert({
+          where : { key },
+          create: { key, value: { bps } },
+          update: { value: { bps } },
+        }));
+      }
+    }
+
+    await Promise.all(ops);
+
+    await audit.log({
+      userId : req.user.sub,
+      action : 'FEES_UPDATED',
+      details: body as any,
+      level  : 'HIGH',
+    });
+
+    logger.info({ ...body, by: req.user.sub }, 'Admin: taxas atualizadas');
+    return reply.send({ message: 'Taxas atualizadas' });
+  });
+
+  // GET /admin/fees/users — usuários com taxa personalizada + busca
+  app.get('/fees/users', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const { q = '', onlyCustom } = req.query as { q?: string; onlyCustom?: string };
+    const search = q.trim();
+    const onlyCustomFlag = onlyCustom === '1' || onlyCustom === 'true';
+
+    const userFilter = search
+      ? { OR: [
+          { name : { contains: search, mode: 'insensitive' as const } },
+          { email: { contains: search, mode: 'insensitive' as const } },
+        ]}
+      : {};
+
+    const [producers, affiliates] = await Promise.all([
+      prisma.producer.findMany({
+        where  : onlyCustomFlag
+          ? { customFeeBps: { not: null }, user: userFilter }
+          : { user: userFilter },
+        include: { user: { select: { id: true, name: true, email: true } } },
+        take   : 50,
+      }),
+      prisma.affiliate.findMany({
+        where  : onlyCustomFlag
+          ? { customFeeBps: { not: null }, user: userFilter }
+          : { user: userFilter },
+        include: { user: { select: { id: true, name: true, email: true } } },
+        take   : 50,
+      }),
+    ]);
+
+    const rows = [
+      ...producers .map(p => ({ userId: p.userId, name: p.user.name, email: p.user.email, role: 'PRODUCER'  as const, customFeeBps: p.customFeeBps })),
+      ...affiliates.map(a => ({ userId: a.userId, name: a.user.name, email: a.user.email, role: 'AFFILIATE' as const, customFeeBps: a.customFeeBps })),
+    ].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+    return reply.send({ data: rows, total: rows.length });
+  });
+
+  // PUT /admin/fees/users/:userId — define taxa personalizada
+  app.put('/fees/users/:userId', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const { userId } = req.params as { userId: string };
+    const { customFeeBps } = z.object({
+      customFeeBps: z.number().int().min(0).max(10000).nullable(),
+    }).parse(req.body);
+
+    const [producer, affiliate] = await Promise.all([
+      prisma.producer.findUnique({ where: { userId }, select: { id: true } }),
+      prisma.affiliate.findUnique({ where: { userId }, select: { id: true } }),
+    ]);
+
+    if (!producer && !affiliate) {
+      return reply.status(404).send({ message: 'Usuário não é produtor nem afiliado' });
+    }
+
+    if (producer)  await prisma.producer .update({ where: { userId }, data: { customFeeBps } });
+    if (affiliate) await prisma.affiliate.update({ where: { userId }, data: { customFeeBps } });
+
+    await audit.log({
+      userId : req.user.sub,
+      action : 'USER_CUSTOM_FEE_SET',
+      details: { targetUserId: userId, customFeeBps },
+      level  : 'HIGH',
+    });
+
+    return reply.send({ message: customFeeBps === null ? 'Taxa personalizada removida' : 'Taxa personalizada definida' });
+  });
+
   // ── AMBIENTE DE TESTE ──────────────────────────────────────────
 
   // GET /admin/test/order/:code — busca pedido pelo código (últimos 8 chars do ID)
