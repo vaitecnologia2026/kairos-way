@@ -134,35 +134,56 @@ export async function adminRoutes(app: FastifyInstance) {
   // TAXAS E COMISSÕES
   // ══════════════════════════════════════════════════════════════════
   // Armazenadas em PlatformConfig com as keys:
-  //   fees.platform            → taxa geral da plataforma (bps)
-  //   fees.acquirer.PAGARME    → taxa cobrada pelo Pagar.me (bps)
-  //   fees.acquirer.STONE      → taxa cobrada pelo Stone (bps)
-  //   fees.acquirer.ASAAS      → taxa cobrada pelo Asaas (bps)
-  //   fees.acquirer.CIELO      → taxa cobrada pela Cielo (bps)
+  //   fees.platform            → taxa geral da plataforma em bps (% da venda)
+  //   fees.acquirer.PAGARME    → taxa cobrada pelo Pagar.me em cents (R$ fixo por transação)
   //
   // Taxas personalizadas ficam em Producer.customFeeBps / Affiliate.customFeeBps
-  // (null = usa a taxa geral)
+  // (null = usa a taxa geral). Isto se aplica à taxa da plataforma (% da venda).
   //
-  // Lucro da plataforma = taxa plataforma (cobrada do usuário) − taxa adquirente
+  // Modelo de lucro:
+  //   Plataforma cobra % da venda do produtor/afiliado
+  //   Plataforma paga R$ fixo ao adquirente por transação
+  //   Lucro por venda = (% plataforma × valor) − (R$ adquirente)
 
-  const ACQUIRERS = ['PAGARME', 'STONE', 'ASAAS', 'CIELO'] as const;
+  const ACQUIRERS = ['PAGARME'] as const;
 
-  // GET /admin/fees — retorna taxa geral, por adquirente e cálculo de lucro
+  // GET /admin/platform-fee — taxa da plataforma para usuário logado
+  // (respeita customFeeBps de Producer/Affiliate se definido)
+  app.get('/platform-fee', { preHandler: [authenticate] }, async (req, reply) => {
+    const row = await prisma.platformConfig.findUnique({ where: { key: 'fees.platform' } });
+    const generalBps = (row?.value as any)?.bps ?? 0;
+
+    // Checar taxa personalizada
+    const [producer, affiliate] = await Promise.all([
+      prisma.producer .findUnique({ where: { userId: req.user.sub }, select: { customFeeBps: true } }),
+      prisma.affiliate.findUnique({ where: { userId: req.user.sub }, select: { customFeeBps: true } }),
+    ]);
+
+    const customBps = producer?.customFeeBps ?? affiliate?.customFeeBps ?? null;
+    const effectiveBps = customBps !== null ? customBps : generalBps;
+
+    return reply.send({
+      platformBps  : effectiveBps,
+      platformPct  : effectiveBps / 100,
+      isCustom     : customBps !== null,
+      generalBps,
+    });
+  });
+
+  // GET /admin/fees — retorna taxa geral e taxa do adquirente
   app.get('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (_req, reply) => {
     const rows = await prisma.platformConfig.findMany({
       where: { key: { startsWith: 'fees.' } },
     });
 
     const map: Record<string, any> = {};
-    for (const r of rows) map[r.key] = (r.value as any)?.bps ?? 0;
+    for (const r of rows) map[r.key] = r.value as any;
 
-    const platformBps = map['fees.platform'] ?? 0;
-    const acquirers: Record<string, { bps: number; profitBps: number }> = {};
+    const platformBps = map['fees.platform']?.bps ?? 0;
+    const acquirers: Record<string, { cents: number }> = {};
     for (const acq of ACQUIRERS) {
-      const acqBps = map[`fees.acquirer.${acq}`] ?? 0;
       acquirers[acq] = {
-        bps      : acqBps,
-        profitBps: platformBps - acqBps, // pode ser negativo se acquirer > platform
+        cents: map[`fees.acquirer.${acq}`]?.cents ?? 0,
       };
     }
 
@@ -177,7 +198,7 @@ export async function adminRoutes(app: FastifyInstance) {
   app.post('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
     const body = z.object({
       platformBps: z.number().int().min(0).max(10000).optional(),
-      acquirers  : z.record(z.enum(ACQUIRERS), z.number().int().min(0).max(10000)).optional(),
+      acquirers  : z.record(z.enum(ACQUIRERS), z.number().int().min(0)).optional(),
     }).parse(req.body);
 
     const ops: any[] = [];
@@ -191,12 +212,12 @@ export async function adminRoutes(app: FastifyInstance) {
     }
 
     if (body.acquirers) {
-      for (const [acq, bps] of Object.entries(body.acquirers)) {
+      for (const [acq, cents] of Object.entries(body.acquirers)) {
         const key = `fees.acquirer.${acq}`;
         ops.push(prisma.platformConfig.upsert({
           where : { key },
-          create: { key, value: { bps } },
-          update: { value: { bps } },
+          create: { key, value: { cents } },
+          update: { value: { cents } },
         }));
       }
     }
