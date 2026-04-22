@@ -231,6 +231,7 @@ model Producer {
   rejectedReason String?
   customFeeBps  Int?      // @deprecated — manter por compat; use customFees
   customFees    Json?     // taxas personalizadas por método: { PIX?: {bps,cents}, BOLETO?: {...}, CARD?: {...}, WITHDRAWAL?: {...} } — campo ausente/null = herda da geral
+  customReleaseDays Json? // prazos personalizados: { PIX?: 1, BOLETO?: 2, CARD?: 15 } — campo ausente = herda padrão
   metadata      Json?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
@@ -347,6 +348,7 @@ model SplitRecord {
   amountCents     Int
   status          SplitStatus   @default(PENDING)
   acquirerSplitId String?
+  availableAt     DateTime?     // data em que o valor fica disponível para saque (data_aprovação + prazo)
   paidAt          DateTime?
   failedAt        DateTime?
   failReason      String?
@@ -460,6 +462,7 @@ model Affiliate {
   canCreateProducts Boolean @default(false)
   customFeeBps Int?      // @deprecated — use customFees
   customFees   Json?     // taxas personalizadas por método (ver Producer.customFees)
+  customReleaseDays Json? // prazos personalizados (ver Producer.customReleaseDays)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

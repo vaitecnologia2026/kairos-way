@@ -319,6 +319,121 @@ export async function adminRoutes(app: FastifyInstance) {
     return reply.send({ message: toSave === null ? 'Taxa personalizada removida' : 'Taxa personalizada definida' });
   });
 
+  // ══════════════════════════════════════════════════════════════════
+  // PRAZOS DE LIBERAÇÃO (release days)
+  // ══════════════════════════════════════════════════════════════════
+  // Configuração geral em PlatformConfig (release.PIX / release.BOLETO / release.CARD)
+  // Override por usuário em Producer.customReleaseDays / Affiliate.customReleaseDays
+
+  const RELEASE_METHODS_LOCAL = ['PIX', 'BOLETO', 'CARD'] as const;
+  const releaseDaysSchema = z.record(z.enum(RELEASE_METHODS_LOCAL), z.number().int().min(0).max(180));
+
+  // GET /admin/release-days — prazos padrão da plataforma
+  app.get('/release-days', { preHandler: [authenticate, requireRole('ADMIN')] }, async (_req, reply) => {
+    const { getPlatformReleaseDays } = await import('../../shared/services/release.service');
+    const days = await getPlatformReleaseDays();
+    return reply.send({ days });
+  });
+
+  // POST /admin/release-days — atualiza prazos padrão
+  app.post('/release-days', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const body = z.object({
+      days: releaseDaysSchema,
+    }).parse(req.body);
+
+    const { setPlatformReleaseDays } = await import('../../shared/services/release.service');
+    await setPlatformReleaseDays(body.days as any);
+
+    await audit.log({
+      userId : req.user.sub,
+      action : 'RELEASE_DAYS_UPDATED',
+      details: body as any,
+      level  : 'HIGH',
+    });
+
+    return reply.send({ message: 'Prazos atualizados' });
+  });
+
+  // PUT /admin/release-days/users/:userId — prazos personalizados por usuário
+  app.put('/release-days/users/:userId', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const { userId } = req.params as { userId: string };
+    const body = z.object({
+      customReleaseDays: releaseDaysSchema.nullable(),
+    }).parse(req.body);
+
+    const [producer, affiliate] = await Promise.all([
+      prisma.producer .findUnique({ where: { userId }, select: { id: true } }),
+      prisma.affiliate.findUnique({ where: { userId }, select: { id: true } }),
+    ]);
+
+    if (!producer && !affiliate) {
+      return reply.status(404).send({ message: 'Usuário não é produtor nem afiliado' });
+    }
+
+    const cleaned = body.customReleaseDays
+      ? Object.fromEntries(Object.entries(body.customReleaseDays).filter(([, v]) => typeof v === 'number' && v >= 0))
+      : null;
+    const toSave  = cleaned && Object.keys(cleaned).length > 0 ? cleaned : null;
+
+    if (producer)  await prisma.producer .update({ where: { userId }, data: { customReleaseDays: toSave as any } });
+    if (affiliate) await prisma.affiliate.update({ where: { userId }, data: { customReleaseDays: toSave as any } });
+
+    await audit.log({
+      userId : req.user.sub,
+      action : 'USER_RELEASE_DAYS_SET',
+      details: { targetUserId: userId, customReleaseDays: toSave },
+      level  : 'HIGH',
+    });
+
+    return reply.send({ message: toSave === null ? 'Prazo personalizado removido' : 'Prazo personalizado definido' });
+  });
+
+  // GET /admin/release-days/users — lista usuários com prazo personalizado + busca
+  app.get('/release-days/users', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const { q = '', onlyCustom, role } = req.query as { q?: string; onlyCustom?: string; role?: string };
+    const search = q.trim();
+    const onlyCustomFlag = onlyCustom === '1' || onlyCustom === 'true';
+    const roleFilter = role === 'PRODUCER' || role === 'AFFILIATE' ? role : null;
+
+    const userFilter = search
+      ? { OR: [
+          { name : { contains: search, mode: 'insensitive' as const } },
+          { email: { contains: search, mode: 'insensitive' as const } },
+        ]}
+      : {};
+
+    const wantProducers  = roleFilter === null || roleFilter === 'PRODUCER';
+    const wantAffiliates = roleFilter === null || roleFilter === 'AFFILIATE';
+
+    const [producers, affiliates] = await Promise.all([
+      wantProducers
+        ? prisma.producer.findMany({
+            where  : onlyCustomFlag
+              ? { customReleaseDays: { not: null as any }, user: userFilter }
+              : { user: userFilter },
+            include: { user: { select: { id: true, name: true, email: true } } },
+            take   : 50,
+          })
+        : Promise.resolve([]),
+      wantAffiliates
+        ? prisma.affiliate.findMany({
+            where  : onlyCustomFlag
+              ? { customReleaseDays: { not: null as any }, user: userFilter }
+              : { user: userFilter },
+            include: { user: { select: { id: true, name: true, email: true } } },
+            take   : 50,
+          })
+        : Promise.resolve([]),
+    ]);
+
+    const rows = [
+      ...producers .map(p => ({ userId: p.userId, name: p.user.name, email: p.user.email, role: 'PRODUCER'  as const, customReleaseDays: p.customReleaseDays as any })),
+      ...affiliates.map(a => ({ userId: a.userId, name: a.user.name, email: a.user.email, role: 'AFFILIATE' as const, customReleaseDays: a.customReleaseDays as any })),
+    ].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+    return reply.send({ data: rows, total: rows.length });
+  });
+
   // ── AMBIENTE DE TESTE ──────────────────────────────────────────
 
   // GET /admin/test/order/:code — busca pedido pelo código (últimos 8 chars do ID)

@@ -148,20 +148,52 @@ export class SplitEngineService {
 
     const producerUserId = order?.offer?.product?.producer?.userId;
 
-    await db.splitRecord.createMany({
-      data: splits.map((s) => ({
+    // Calcula data de liberação por recipient (respeita customReleaseDays)
+    const { calcUserReleaseDate } = await import('../../shared/services/release.service');
+    const approvedAt = order?.approvedAt || new Date();
+
+    const releaseCache = new Map<string, Date>();
+    const resolveAvailableAt = async (recipientId: string | null): Promise<Date | null> => {
+      if (!recipientId) return null;
+      if (releaseCache.has(recipientId)) return releaseCache.get(recipientId)!;
+      try {
+        const { availableAt } = await calcUserReleaseDate({
+          userId       : recipientId,
+          paymentMethod: order?.paymentMethod ?? null,
+          approvedAt,
+        });
+        releaseCache.set(recipientId, availableAt);
+        return availableAt;
+      } catch {
+        return null;
+      }
+    };
+
+    const data: any[] = [];
+    for (const s of splits) {
+      const recipientId = s.recipientId
+        ? s.recipientId
+        : s.recipientType === 'PRODUCER'
+          ? (producerUserId || null)
+          : null;
+
+      // Plataforma não tem prazo de liberação — é imediato
+      const availableAt = s.recipientType === 'PLATFORM'
+        ? approvedAt
+        : await resolveAvailableAt(recipientId);
+
+      data.push({
         orderId,
         splitRuleId  : s.splitRuleId,
         recipientType: s.recipientType,
-        recipientId  : s.recipientId
-          ? s.recipientId
-          : s.recipientType === 'PRODUCER'
-            ? (producerUserId || null)
-            : null,
+        recipientId,
         amountCents  : s.amountCents,
         status       : 'PENDING',
-      })),
-    });
+        availableAt,
+      });
+    }
+
+    await db.splitRecord.createMany({ data });
     logger.info({ orderId, count: splits.length }, 'SplitEngine: registros de split salvos');
   }
 
@@ -181,36 +213,56 @@ export class SplitEngineService {
     });
   }
 
-  /** Saldo disponível de um usuário (splits pagos - saques) */
+  /**
+   * Saldo de um usuário considerando prazos de liberação:
+   *   - availableCents: splits já liberados (availableAt <= agora ou PAID) menos saques
+   *   - pendingCents:   splits ainda não liberados (availableAt > agora)
+   *   - totalCents:     soma liberada até agora
+   */
   async getUserBalance(userId: string): Promise<{
     availableCents: number;
-    pendingCents: number;
-    totalCents: number;
+    pendingCents  : number;
+    totalCents    : number;
   }> {
-    const [available, pending] = await Promise.all([
+    const now = new Date();
+
+    // Liberado = PAID OU (PENDING e availableAt <= now) OU (availableAt == null)
+    // Não liberado = availableAt > now
+    const [released, notReleased, withdrawals] = await Promise.all([
       prisma.splitRecord.aggregate({
-        where: { recipientId: userId, status: 'PAID' },
+        where: {
+          recipientId: userId,
+          status     : { in: ['PAID', 'PENDING'] },
+          OR: [
+            { availableAt: null },
+            { availableAt: { lte: now } },
+          ],
+        },
         _sum: { amountCents: true },
       }),
       prisma.splitRecord.aggregate({
-        where: { recipientId: userId, status: 'PENDING' },
+        where: {
+          recipientId: userId,
+          status     : 'PENDING',
+          availableAt: { gt: now },
+        },
         _sum: { amountCents: true },
+      }),
+      prisma.withdrawal.aggregate({
+        where: { userId, status: { in: ['PAID', 'PROCESSING'] } },
+        _sum : { amountCents: true },
       }),
     ]);
 
-    const withdrawals = await prisma.withdrawal.aggregate({
-      where: { userId, status: { in: ['PAID', 'PROCESSING'] } },
-      _sum: { amountCents: true },
-    });
-
-    const totalPaid = available._sum.amountCents || 0;
-    const totalWithdrawn = withdrawals._sum.amountCents || 0;
-    const availableCents = totalPaid - totalWithdrawn;
+    const totalReleased   = released._sum.amountCents || 0;
+    const totalPending    = notReleased._sum.amountCents || 0;
+    const totalWithdrawn  = withdrawals._sum.amountCents || 0;
+    const availableCents  = Math.max(0, totalReleased - totalWithdrawn);
 
     return {
-      availableCents: Math.max(0, availableCents),
-      pendingCents: pending._sum.amountCents || 0,
-      totalCents: totalPaid,
+      availableCents,
+      pendingCents: totalPending,
+      totalCents  : totalReleased,
     };
   }
 }
