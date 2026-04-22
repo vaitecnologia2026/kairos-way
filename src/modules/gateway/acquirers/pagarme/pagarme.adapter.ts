@@ -216,12 +216,34 @@ export class PagarmeAdapter implements IAcquirerAdapter {
         throw new PaymentError('Resposta inválida do Pagar.me para boleto');
       }
 
+      // Pagar.me V5 pode retornar PDF em campos diferentes conforme a conta:
+      //   lastTransaction.pdf                 (mais comum)
+      //   lastTransaction.url                 (boleto digital)
+      //   lastTransaction.billet_url
+      //   lastTransaction.boleto_url
+      const boletoUrl = lastTransaction.pdf
+        || lastTransaction.url
+        || lastTransaction.billet_url
+        || lastTransaction.boleto_url
+        || null;
+      const boletoBarcode = lastTransaction.line
+        || lastTransaction.barcode
+        || lastTransaction.boleto_barcode
+        || null;
+
+      logger.info({
+        chargeId     : charge.id,
+        hasPdf       : !!boletoUrl,
+        hasBarcode   : !!boletoBarcode,
+        txKeys       : Object.keys(lastTransaction),
+      }, 'BOLETO_DEBUG: campos retornados pelo Pagar.me');
+
       return {
-        acquirer    : 'PAGARME',
-        acquirerTxId: charge.id,
-        status      : 'PENDING', // boleto sempre PENDING até pagamento
-        boletoUrl   : lastTransaction.pdf,
-        boletoBarcode: lastTransaction.line,
+        acquirer     : 'PAGARME',
+        acquirerTxId : charge.id,
+        status       : 'PENDING', // boleto sempre PENDING até pagamento
+        boletoUrl    : boletoUrl || undefined,
+        boletoBarcode: boletoBarcode || undefined,
       };
     } catch (err: any) {
       this.handleError(err, 'BOLETO');

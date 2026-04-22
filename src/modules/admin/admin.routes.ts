@@ -37,6 +37,31 @@ export async function adminRoutes(app: FastifyInstance) {
     });
   });
 
+  // DELETE /admin/users/by-email — remove usuário por email (útil para refazer testes)
+  // Remove em cascata: Producer, Affiliate, Sessions, Notifications, etc.
+  app.delete('/users/by-email', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const body = z.object({ email: z.string().email() }).parse(req.body);
+    const user = await prisma.user.findUnique({ where: { email: body.email } });
+    if (!user) return reply.status(404).send({ message: 'Usuário não encontrado' });
+    if (user.role === 'ADMIN') return reply.status(422).send({ message: 'Não é possível remover admin' });
+
+    // Dependências que não têm ON DELETE CASCADE
+    await prisma.notification.deleteMany({ where: { userId: user.id } });
+    await prisma.auditLog.deleteMany({ where: { userId: user.id } });
+
+    // User tem cascade em Producer/Affiliate/Session/PushToken
+    await prisma.user.delete({ where: { id: user.id } });
+
+    await audit.log({
+      userId : req.user.sub,
+      action : 'USER_DELETED',
+      details: { targetEmail: body.email, targetRole: user.role },
+      level  : 'CRITICAL',
+    });
+
+    return reply.send({ message: `Usuário ${body.email} removido com sucesso` });
+  });
+
   // GET /admin/users — listar todos os usuários
   app.get('/users', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
     const { page = '1', limit = '50', role } = req.query as any;
