@@ -4,7 +4,7 @@ import { authenticate, requireRole } from '../../shared/middleware/auth.middlewa
 import { AuditService } from '../audit/audit.service';
 import { prisma } from '../../shared/utils/prisma';
 import { NotFoundError, AppError } from '../../shared/errors/AppError';
-import { enqueueEmail } from '../../shared/queue/workers';
+import { enqueueEmail } from '../../shared/queue/enqueue';
 
 const auditService = new AuditService();
 

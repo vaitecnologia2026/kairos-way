@@ -77,6 +77,13 @@ export async function financialRoutes(app: FastifyInstance) {
       details: { amountCents: body.amountCents }, level: 'HIGH',
     });
 
+    // Notifica admins
+    try {
+      const user = await prisma.user.findUnique({ where: { id: req.user.sub }, select: { name: true } });
+      const { notifyWithdrawalRequested } = await import('../../shared/utils/notify');
+      await notifyWithdrawalRequested({ requesterName: user?.name ?? 'Usuário', amountCents: body.amountCents });
+    } catch { /* fire-and-forget */ }
+
     return reply.status(201).send(withdrawal);
   });
 
@@ -269,7 +276,7 @@ export async function financialRoutes(app: FastifyInstance) {
     // Marcar todos como PAID
     const result = await prisma.splitRecord.updateMany({
       where: { id: { in: pending.map(p => p.id) }, status: 'PENDING' },
-      data : { status: 'PAID', processedAt: new Date() },
+      data : { status: 'PAID', paidAt: new Date() },
     });
 
     await audit.log({
