@@ -51,7 +51,15 @@ export async function authRoutes(app: FastifyInstance) {
   // GET /auth/me
   app.get('/me', { preHandler: [authenticate] }, async (request, reply) => {
     const user = await authService.getMe(request.user.sub);
-    return reply.send(user);
+    // Anexa endereço salvo em Producer.metadata.address OU Affiliate.metadata.address
+    const [producer, affiliate] = await Promise.all([
+      prisma.producer .findUnique({ where: { userId: request.user.sub }, select: { metadata: true } }),
+      prisma.affiliate.findUnique({ where: { userId: request.user.sub }, select: { metadata: true } }),
+    ]);
+    const prodAddr = (producer?.metadata  as any)?.address;
+    const affAddr  = (affiliate?.metadata as any)?.address;
+    const address  = prodAddr || affAddr || null;
+    return reply.send({ ...user, address });
   });
 
   // POST /auth/register (LP → produtor)
@@ -97,19 +105,64 @@ export async function authRoutes(app: FastifyInstance) {
 
   // PATCH /auth/profile — atualizar dados do perfil
   app.patch('/profile', { preHandler: [authenticate] }, async (request, reply) => {
-    const { name, document, phone, birthDate, avatarUrl } = request.body as any;
-    const data: any = {};
-    if (name)      data.name      = name;
-    if (document)  data.document  = document;
-    if (phone)     data.phone     = phone;
-    if (avatarUrl) data.avatarUrl = avatarUrl;
-    if (birthDate) data.birthDate = new Date(birthDate);
+    const body = request.body as any;
+    const { name, document, phone, birthDate, avatarUrl } = body;
+
+    // Dados do User
+    const userData: any = {};
+    if (name)      userData.name      = name;
+    if (document)  userData.document  = document;
+    if (phone)     userData.phone     = phone;
+    if (avatarUrl) userData.avatarUrl = avatarUrl;
+    if (birthDate) userData.birthDate = new Date(birthDate);
 
     const updated = await prisma.user.update({
       where : { id: request.user.sub },
-      data,
+      data  : userData,
       select: { id: true, name: true, email: true, role: true, document: true, phone: true, birthDate: true, avatarUrl: true },
     });
+
+    // Endereço — salva em Producer.metadata.address OU Affiliate.metadata.address
+    const addressFields = {
+      zipCode     : body.zipCode,
+      street      : body.street,
+      number      : body.number,
+      complement  : body.complement,
+      neighborhood: body.neighborhood,
+      city        : body.city,
+      state       : body.state ? String(body.state).toUpperCase() : undefined,
+    };
+    const hasAddressInput = Object.values(addressFields).some(v => v && String(v).trim());
+
+    if (hasAddressInput) {
+      // Limpa vazios
+      const cleanAddress = Object.fromEntries(
+        Object.entries(addressFields).filter(([, v]) => v && String(v).trim())
+      );
+
+      const [producer, affiliate] = await Promise.all([
+        prisma.producer .findUnique({ where: { userId: request.user.sub }, select: { id: true, metadata: true } }),
+        prisma.affiliate.findUnique({ where: { userId: request.user.sub }, select: { id: true, metadata: true } }),
+      ]);
+
+      if (producer) {
+        await prisma.producer.update({
+          where: { userId: request.user.sub },
+          data : {
+            metadata: { ...(producer.metadata as object || {}), address: cleanAddress } as any,
+          },
+        });
+      }
+      if (affiliate) {
+        await prisma.affiliate.update({
+          where: { userId: request.user.sub },
+          data : {
+            metadata: { ...(affiliate.metadata as object || {}), address: cleanAddress } as any,
+          },
+        });
+      }
+    }
+
     return reply.send(updated);
   });
 }
