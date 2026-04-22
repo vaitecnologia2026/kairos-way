@@ -21,6 +21,23 @@ export async function reportRoutes(app: FastifyInstance) {
     if (req.user.role === 'PRODUCER') {
       const p = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
       where.offer = { product: { producerId: p?.id } };
+    } else if (req.user.role === 'AFFILIATE') {
+      // Afiliado co-produtor (canCreateProducts=true) vê:
+      //   (a) vendas dos produtos dele (como produtor)
+      //   (b) vendas onde ele é o afiliado (comissão)
+      const [affiliate, asProducer] = await Promise.all([
+        prisma.affiliate.findUnique({ where: { userId: req.user.sub } }),
+        prisma.producer.findUnique({ where: { userId: req.user.sub } }),
+      ]);
+      const producerId = asProducer?.id;
+      const affiliateId = affiliate?.id;
+      where.OR = [
+        ...(producerId  ? [{ offer: { product: { producerId } } }] : []),
+        ...(affiliateId ? [{ affiliateId }]                         : []),
+      ];
+      if (where.OR.length === 0) {
+        return reply.send({ data: [], total: 0, page: Number(page), limit: Number(limit), totalRevenueCents: 0 });
+      }
     }
 
     const [data, total, aggregate] = await Promise.all([

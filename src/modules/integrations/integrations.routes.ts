@@ -9,7 +9,7 @@ import { buildNFeIo }       from '../../shared/services/nfeio.service';
 
 const audit = new AuditService();
 
-const PROVIDERS = ['MELHOR_ENVIO', 'NFE_IO', 'PLUGA'] as const;
+const PROVIDERS = ['MELHOR_ENVIO', 'NFE_IO'] as const;
 type Provider = typeof PROVIDERS[number];
 
 // Schemas de config por provider (validação)
@@ -25,10 +25,6 @@ const CONFIG_SCHEMAS: Record<Provider, z.ZodTypeAny> = {
     companyId       : z.string().min(1, 'Company ID obrigatório'),
     cityServiceCode : z.string().optional(),
   }),
-  PLUGA: z.object({
-    webhookUrl : z.string().url('URL inválida').optional(),
-    apiKey     : z.string().optional(),
-  }),
 };
 
 /** Remove campos sensíveis antes de retornar ao frontend. */
@@ -41,13 +37,69 @@ function maskConfig(provider: Provider, config: any): any {
   if (provider === 'NFE_IO') {
     return { ...config, apiKey: config.apiKey ? mask(config.apiKey) : '' };
   }
-  if (provider === 'PLUGA') {
-    return { ...config, apiKey: config.apiKey ? mask(config.apiKey) : '' };
-  }
   return config;
 }
 
 export async function integrationsRoutes(app: FastifyInstance) {
+
+  // ── POST /integrations/nfe-callback — recebe resultado da NFe.io (via Pluga)
+  // Público (sem auth). Use um segredo em query (?key=XYZ) para validar.
+  // No Pluga, após o passo "Create NFS-e", adicione um passo "HTTP Request":
+  //   URL:    {BACKEND}/integrations/nfe-callback?orderId={order.code}&key={secret}
+  //   Method: POST
+  //   Body:   { id, number, status, pdfUrl, xmlUrl }  (os retornados pelo NFe.io)
+  app.post('/nfe-callback', async (req, reply) => {
+    const q = req.query as { orderId?: string; key?: string };
+    const expected = process.env.NFE_CALLBACK_SECRET;
+    if (expected && q.key !== expected) {
+      return reply.status(403).send({ message: 'chave inválida' });
+    }
+    if (!q.orderId) return reply.status(400).send({ message: 'orderId obrigatório' });
+
+    // Encontra order por código (últimos 8 chars upper) ou por ID direto
+    const code = q.orderId.toUpperCase();
+    const order = await prisma.order.findFirst({
+      where: {
+        OR: [
+          { id: q.orderId },
+          { id: { endsWith: code.toLowerCase() } },
+          { id: { endsWith: code } },
+        ],
+      },
+    });
+    if (!order) return reply.status(404).send({ message: 'pedido não encontrado' });
+
+    const body = z.object({
+      id      : z.string().optional(),
+      number  : z.union([z.string(), z.number()]).optional(),
+      status  : z.string().optional(),
+      pdfUrl  : z.string().url().optional(),
+      xmlUrl  : z.string().url().optional(),
+    }).parse(req.body ?? {});
+
+    const mappedStatus =
+      body.status === 'Issued' || body.status === 'issued'        ? 'issued'
+    : body.status === 'IssuedWithErrors' || body.status === 'failed' ? 'failed'
+    :                                                                  'processing';
+
+    await prisma.order.update({
+      where: { id: order.id },
+      data : {
+        metadata: {
+          ...(order.metadata as object || {}),
+          nfe: {
+            id    : body.id,
+            number: body.number ? String(body.number) : undefined,
+            status: mappedStatus,
+            pdfUrl: body.pdfUrl,
+            xmlUrl: body.xmlUrl,
+          },
+        },
+      },
+    });
+
+    return reply.send({ ok: true, orderId: order.id, status: mappedStatus });
+  });
 
   // GET /integrations — lista integrações do usuário logado
   app.get('/', { preHandler: [authenticate] }, async (req, reply) => {
