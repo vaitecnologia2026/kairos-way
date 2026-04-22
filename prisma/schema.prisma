@@ -229,7 +229,8 @@ model Producer {
   rejectedAt    DateTime?
   rejectedBy    String?
   rejectedReason String?
-  customFeeBps  Int?      // taxa personalizada em basis points (null = usa taxa geral)
+  customFeeBps  Int?      // @deprecated — manter por compat; use customFees
+  customFees    Json?     // taxas personalizadas por método: { PIX?: {bps,cents}, BOLETO?: {...}, CARD?: {...}, WITHDRAWAL?: {...} } — campo ausente/null = herda da geral
   metadata      Json?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
@@ -387,6 +388,7 @@ model Order {
   userAgent       String?
   fingerprint     String?
   metadata        Json?
+  appliedFees     Json?          // snapshot da taxa no momento da transação: { method, platform: {bps,cents}, acquirer: {bps,cents}, platformCents, acquirerCents, marginCents }
   approvedAt      DateTime?
   rejectedAt      DateTime?
   refundedAt      DateTime?
@@ -456,7 +458,8 @@ model Affiliate {
   rejectedAt   DateTime?
   rejectedReason String?
   canCreateProducts Boolean @default(false)
-  customFeeBps Int?      // taxa personalizada em basis points (null = usa taxa geral)
+  customFeeBps Int?      // @deprecated — use customFees
+  customFees   Json?     // taxas personalizadas por método (ver Producer.customFees)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

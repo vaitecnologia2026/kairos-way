@@ -131,29 +131,26 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ══════════════════════════════════════════════════════════════════
-  // TAXAS E COMISSÕES — granular por método de pagamento
+  // TAXAS E COMISSÕES (v2) — estrutura oficial
   // ══════════════════════════════════════════════════════════════════
-  // Armazenadas em PlatformConfig com uma key por método:
-  //   fees.PIX          → { platform: {mode,value}, acquirer: {mode,value} }
-  //   fees.BOLETO       → idem
-  //   fees.CARD_1X      → crédito à vista
-  //   fees.CARD_2X ... CARD_12X → parcelado
-  //   fees.WITHDRAWAL   → taxa de saque
+  // 4 métodos: PIX, BOLETO, CARD, WITHDRAWAL
+  // Cada taxa: { platform: {bps?, cents?}, acquirer: {bps?, cents?} }
+  //   → bps (% em basis points) e cents (R$ fixo) podem coexistir
   //
-  //   mode: 'PERCENT' (value em basis points) ou 'FIXED' (value em cents)
+  // Taxa personalizada por usuário:
+  //   Producer.customFees / Affiliate.customFees = Partial<Record<Method, FeePart>>
+  //   Se customFees[method] existe → substitui a taxa da plataforma para esse método
+  //   Caso contrário → herda taxa geral
   //
-  // Taxas personalizadas ficam em Producer.customFeeBps / Affiliate.customFeeBps
-  // (blanket override em bps aplicado a todos os métodos em modo PERCENT).
+  // A taxa do adquirente NÃO é customizável por usuário — vem só da config geral.
   //
-  // Lucro por transação = parte da plataforma − parte do adquirente
+  // Snapshot: cada Order salva em appliedFees a taxa aplicada no momento da venda.
 
-  const CARD_TYPES = Array.from({ length: 12 }, (_, i) => `CARD_${i + 1}X` as const);
-  const FEE_TYPES  = ['PIX', 'BOLETO', ...CARD_TYPES, 'WITHDRAWAL'] as const;
-  type FeeType     = typeof FEE_TYPES[number];
+  const FEE_METHODS_LOCAL = ['PIX', 'BOLETO', 'CARD', 'WITHDRAWAL'] as const;
 
   const feePartSchema = z.object({
-    mode : z.enum(['PERCENT', 'FIXED']),
-    value: z.number().int().min(0),
+    bps  : z.number().int().min(0).optional(),
+    cents: z.number().int().min(0).optional(),
   });
 
   const feeConfigSchema = z.object({
@@ -161,64 +158,49 @@ export async function adminRoutes(app: FastifyInstance) {
     acquirer: feePartSchema,
   });
 
-  const DEFAULT_PART = { mode: 'PERCENT' as const, value: 0 };
-  const DEFAULT_FEE  = { platform: DEFAULT_PART, acquirer: DEFAULT_PART };
+  const EMPTY_FEE = { platform: {}, acquirer: {} };
 
-  // GET /admin/platform-fee — taxa PIX padrão do usuário logado (compat com código legado)
+  // GET /admin/platform-fee — taxa PIX padrão (compat legado, usa PIX como default visual)
   app.get('/platform-fee', { preHandler: [authenticate] }, async (req, reply) => {
-    const row = await prisma.platformConfig.findUnique({ where: { key: 'fees.PIX' } });
-    const pix = (row?.value as any) ?? DEFAULT_FEE;
-    const generalBps = pix.platform?.mode === 'PERCENT' ? (pix.platform.value ?? 0) : 0;
-
-    const [producer, affiliate] = await Promise.all([
-      prisma.producer .findUnique({ where: { userId: req.user.sub }, select: { customFeeBps: true } }),
-      prisma.affiliate.findUnique({ where: { userId: req.user.sub }, select: { customFeeBps: true } }),
-    ]);
-
-    const customBps    = producer?.customFeeBps ?? affiliate?.customFeeBps ?? null;
-    const effectiveBps = customBps !== null ? customBps : generalBps;
-
+    const { resolveEffectiveFee } = await import('../../shared/services/fees.service');
+    const pix = await resolveEffectiveFee(req.user.sub, 'PIX');
+    const bps = pix.platform.bps ?? 0;
     return reply.send({
-      platformBps: effectiveBps,
-      platformPct: effectiveBps / 100,
-      isCustom   : customBps !== null,
-      generalBps,
+      platformBps: bps,
+      platformPct: bps / 100,
+      isCustom   : pix.isCustom,
     });
   });
 
-  // GET /admin/fees — retorna todas as 15 taxas (PIX, BOLETO, CARD_1X..12X, WITHDRAWAL)
+  // GET /admin/fees — taxa geral (4 métodos)
   app.get('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (_req, reply) => {
     const rows = await prisma.platformConfig.findMany({
       where: { key: { startsWith: 'fees.' } },
     });
-
     const byKey = new Map<string, any>(rows.map(r => [r.key, r.value]));
-    const fees: Record<FeeType, any> = {} as any;
-
-    for (const type of FEE_TYPES) {
-      const raw = byKey.get(`fees.${type}`);
-      fees[type] = raw && raw.platform && raw.acquirer ? raw : DEFAULT_FEE;
+    const fees: Record<string, any> = {};
+    for (const m of FEE_METHODS_LOCAL) {
+      const raw = byKey.get(`fees.${m}`);
+      fees[m] = raw && raw.platform !== undefined ? raw : EMPTY_FEE;
     }
-
     return reply.send({ fees });
   });
 
-  // POST /admin/fees — bulk update de uma ou mais taxas
+  // POST /admin/fees — bulk update
   app.post('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
     const body = z.object({
-      fees: z.record(z.enum(FEE_TYPES), feeConfigSchema),
+      fees: z.record(z.enum(FEE_METHODS_LOCAL), feeConfigSchema),
     }).parse(req.body);
 
     const ops: any[] = [];
-    for (const [type, cfg] of Object.entries(body.fees)) {
-      const key = `fees.${type}`;
+    for (const [method, cfg] of Object.entries(body.fees)) {
+      const key = `fees.${method}`;
       ops.push(prisma.platformConfig.upsert({
         where : { key },
         create: { key, value: cfg as any },
         update: { value: cfg as any },
       }));
     }
-
     await Promise.all(ops);
 
     await audit.log({
@@ -228,11 +210,11 @@ export async function adminRoutes(app: FastifyInstance) {
       level  : 'HIGH',
     });
 
-    logger.info({ ...body, by: req.user.sub }, 'Admin: taxas atualizadas');
+    logger.info({ methods: Object.keys(body.fees), by: req.user.sub }, 'Admin: taxas atualizadas');
     return reply.send({ message: 'Taxas atualizadas' });
   });
 
-  // GET /admin/fees/users — usuários com taxa personalizada + busca + filtro por role
+  // GET /admin/fees/users — usuários + taxas personalizadas (por método)
   app.get('/fees/users', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
     const { q = '', onlyCustom, role } = req.query as { q?: string; onlyCustom?: string; role?: string };
     const search = q.trim();
@@ -253,7 +235,7 @@ export async function adminRoutes(app: FastifyInstance) {
       wantProducers
         ? prisma.producer.findMany({
             where  : onlyCustomFlag
-              ? { customFeeBps: { not: null }, user: userFilter }
+              ? { customFees: { not: null as any }, user: userFilter }
               : { user: userFilter },
             include: { user: { select: { id: true, name: true, email: true } } },
             take   : 50,
@@ -262,7 +244,7 @@ export async function adminRoutes(app: FastifyInstance) {
       wantAffiliates
         ? prisma.affiliate.findMany({
             where  : onlyCustomFlag
-              ? { customFeeBps: { not: null }, user: userFilter }
+              ? { customFees: { not: null as any }, user: userFilter }
               : { user: userFilter },
             include: { user: { select: { id: true, name: true, email: true } } },
             take   : 50,
@@ -271,18 +253,18 @@ export async function adminRoutes(app: FastifyInstance) {
     ]);
 
     const rows = [
-      ...producers .map(p => ({ userId: p.userId, name: p.user.name, email: p.user.email, role: 'PRODUCER'  as const, customFeeBps: p.customFeeBps })),
-      ...affiliates.map(a => ({ userId: a.userId, name: a.user.name, email: a.user.email, role: 'AFFILIATE' as const, customFeeBps: a.customFeeBps })),
+      ...producers .map(p => ({ userId: p.userId, name: p.user.name, email: p.user.email, role: 'PRODUCER'  as const, customFees: p.customFees as any })),
+      ...affiliates.map(a => ({ userId: a.userId, name: a.user.name, email: a.user.email, role: 'AFFILIATE' as const, customFees: a.customFees as any })),
     ].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
     return reply.send({ data: rows, total: rows.length });
   });
 
-  // PUT /admin/fees/users/:userId — define taxa personalizada
+  // PUT /admin/fees/users/:userId — taxa personalizada por método (granular)
   app.put('/fees/users/:userId', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
     const { userId } = req.params as { userId: string };
-    const { customFeeBps } = z.object({
-      customFeeBps: z.number().int().min(0).max(10000).nullable(),
+    const body = z.object({
+      customFees: z.record(z.enum(FEE_METHODS_LOCAL), feePartSchema).nullable(),
     }).parse(req.body);
 
     const [producer, affiliate] = await Promise.all([
@@ -294,17 +276,23 @@ export async function adminRoutes(app: FastifyInstance) {
       return reply.status(404).send({ message: 'Usuário não é produtor nem afiliado' });
     }
 
-    if (producer)  await prisma.producer .update({ where: { userId }, data: { customFeeBps } });
-    if (affiliate) await prisma.affiliate.update({ where: { userId }, data: { customFeeBps } });
+    // Se customFees for null OU objeto vazio, armazena null (herda tudo da geral)
+    const cleaned = body.customFees
+      ? Object.fromEntries(Object.entries(body.customFees).filter(([, v]) => v && ((v as any).bps || (v as any).cents)))
+      : null;
+    const toSave  = cleaned && Object.keys(cleaned).length > 0 ? cleaned : null;
+
+    if (producer)  await prisma.producer .update({ where: { userId }, data: { customFees: toSave as any } });
+    if (affiliate) await prisma.affiliate.update({ where: { userId }, data: { customFees: toSave as any } });
 
     await audit.log({
       userId : req.user.sub,
       action : 'USER_CUSTOM_FEE_SET',
-      details: { targetUserId: userId, customFeeBps },
+      details: { targetUserId: userId, customFees: toSave },
       level  : 'HIGH',
     });
 
-    return reply.send({ message: customFeeBps === null ? 'Taxa personalizada removida' : 'Taxa personalizada definida' });
+    return reply.send({ message: toSave === null ? 'Taxa personalizada removida' : 'Taxa personalizada definida' });
   });
 
   // ── AMBIENTE DE TESTE ──────────────────────────────────────────

@@ -105,6 +105,26 @@ export async function checkoutRoutes(app: FastifyInstance) {
 
     const customerId = (req as any).user?.sub as string | undefined;
 
+    // Snapshot da taxa aplicada — identifica o dono do produto (produtor) e fotografa
+    // a config atual. Mudanças futuras na taxa geral NÃO afetarão este pedido.
+    let appliedFees: any = null;
+    try {
+      const { snapshotFeeForTransaction, paymentToFeeMethod } = await import('../../shared/services/fees.service');
+      const producer = await prisma.producer.findFirst({
+        where : { id: offer.product.producerId },
+        select: { userId: true },
+      });
+      if (producer?.userId) {
+        appliedFees = await snapshotFeeForTransaction({
+          userId   : producer.userId,
+          method   : paymentToFeeMethod(body.method),
+          saleCents: offer.priceCents,
+        });
+      }
+    } catch (err: any) {
+      logger.warn({ err: err.message }, 'Checkout: falha ao fotografar taxa (continuando sem snapshot)');
+    }
+
     const order = await prisma.order.create({
       data: {
         offerId      : offer.id,
@@ -119,6 +139,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
         status       : 'PENDING',
         ipAddress    : req.ip,
         userAgent    : req.headers['user-agent'],
+        appliedFees  : appliedFees as any,
       },
     });
     logger.info({ orderId: order.id, offerId: offer.id, method: body.method, amountCents: offer.priceCents }, 'Checkout: pedido criado');
