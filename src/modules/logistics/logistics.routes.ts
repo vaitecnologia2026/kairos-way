@@ -242,9 +242,17 @@ export async function logisticsRoutes(app: FastifyInstance) {
           .map(q => `${q.name || q.company}: ${q.error}`)
           .join(' | ');
         const msg = errs
-          ? `Transportadoras recusaram este envio — ${errs}`
-          : `Nenhum serviço de entrega disponível. CEP origem=${fromCep}, destino=${toCep}. Verifique se sua conta Melhor Envio está verificada (CPF/CNPJ + endereço).`;
-        throw new AppError(msg, 422);
+          ? `Transportadoras recusaram — ${errs}`
+          : quotes.length === 0
+            ? `Melhor Envio retornou nenhuma opção (origem=${fromCep} destino=${toCep}). Conta ME pode estar sem verificação ou sem endereços cadastrados.`
+            : `Melhor Envio retornou ${quotes.length} opção(ões) mas todas sem preço/erro. Veja 'quotes' para detalhes.`;
+        return reply.status(422).send({
+          statusCode: 422,
+          error     : 'NoShippingOption',
+          message   : msg,
+          debug     : { fromCep, toCep, weightKg, quoteCount: quotes.length },
+          quotes,
+        });
       }
       const cheapest = valid.sort((a, b) => a.priceCents - b.priceCents)[0];
       serviceId = cheapest.id;

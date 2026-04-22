@@ -90,7 +90,13 @@ export class MelhorEnvioService {
 
     try {
       const { data } = await this.api.post('/api/v2/me/shipment/calculate', payload);
-      return (Array.isArray(data) ? data : []).map((d: any) => ({
+      logger.info({ raw: data }, 'MelhorEnvio: resposta bruta do calculate');
+      // ME pode devolver objeto (erro disfarçado com 200 OK) — surface isso
+      if (!Array.isArray(data)) {
+        const msg = data?.message || data?.error || JSON.stringify(data).slice(0, 200);
+        throw new Error(`Melhor Envio retornou não-array: ${msg}`);
+      }
+      return data.map((d: any) => ({
         id          : d.id,
         name        : d.name,
         company     : d.company?.name || 'Transportadora',
