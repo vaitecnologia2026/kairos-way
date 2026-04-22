@@ -131,95 +131,92 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ══════════════════════════════════════════════════════════════════
-  // TAXAS E COMISSÕES
+  // TAXAS E COMISSÕES — granular por método de pagamento
   // ══════════════════════════════════════════════════════════════════
-  // Armazenadas em PlatformConfig com as keys:
-  //   fees.platform            → taxa geral da plataforma em bps (% da venda)
-  //   fees.acquirer.PAGARME    → taxa cobrada pelo Pagar.me em cents (R$ fixo por transação)
+  // Armazenadas em PlatformConfig com uma key por método:
+  //   fees.PIX          → { platform: {mode,value}, acquirer: {mode,value} }
+  //   fees.BOLETO       → idem
+  //   fees.CARD_1X      → crédito à vista
+  //   fees.CARD_2X ... CARD_12X → parcelado
+  //   fees.WITHDRAWAL   → taxa de saque
+  //
+  //   mode: 'PERCENT' (value em basis points) ou 'FIXED' (value em cents)
   //
   // Taxas personalizadas ficam em Producer.customFeeBps / Affiliate.customFeeBps
-  // (null = usa a taxa geral). Isto se aplica à taxa da plataforma (% da venda).
+  // (blanket override em bps aplicado a todos os métodos em modo PERCENT).
   //
-  // Modelo de lucro:
-  //   Plataforma cobra % da venda do produtor/afiliado
-  //   Plataforma paga R$ fixo ao adquirente por transação
-  //   Lucro por venda = (% plataforma × valor) − (R$ adquirente)
+  // Lucro por transação = parte da plataforma − parte do adquirente
 
-  const ACQUIRERS = ['PAGARME'] as const;
+  const CARD_TYPES = Array.from({ length: 12 }, (_, i) => `CARD_${i + 1}X` as const);
+  const FEE_TYPES  = ['PIX', 'BOLETO', ...CARD_TYPES, 'WITHDRAWAL'] as const;
+  type FeeType     = typeof FEE_TYPES[number];
 
-  // GET /admin/platform-fee — taxa da plataforma para usuário logado
-  // (respeita customFeeBps de Producer/Affiliate se definido)
+  const feePartSchema = z.object({
+    mode : z.enum(['PERCENT', 'FIXED']),
+    value: z.number().int().min(0),
+  });
+
+  const feeConfigSchema = z.object({
+    platform: feePartSchema,
+    acquirer: feePartSchema,
+  });
+
+  const DEFAULT_PART = { mode: 'PERCENT' as const, value: 0 };
+  const DEFAULT_FEE  = { platform: DEFAULT_PART, acquirer: DEFAULT_PART };
+
+  // GET /admin/platform-fee — taxa PIX padrão do usuário logado (compat com código legado)
   app.get('/platform-fee', { preHandler: [authenticate] }, async (req, reply) => {
-    const row = await prisma.platformConfig.findUnique({ where: { key: 'fees.platform' } });
-    const generalBps = (row?.value as any)?.bps ?? 0;
+    const row = await prisma.platformConfig.findUnique({ where: { key: 'fees.PIX' } });
+    const pix = (row?.value as any) ?? DEFAULT_FEE;
+    const generalBps = pix.platform?.mode === 'PERCENT' ? (pix.platform.value ?? 0) : 0;
 
-    // Checar taxa personalizada
     const [producer, affiliate] = await Promise.all([
       prisma.producer .findUnique({ where: { userId: req.user.sub }, select: { customFeeBps: true } }),
       prisma.affiliate.findUnique({ where: { userId: req.user.sub }, select: { customFeeBps: true } }),
     ]);
 
-    const customBps = producer?.customFeeBps ?? affiliate?.customFeeBps ?? null;
+    const customBps    = producer?.customFeeBps ?? affiliate?.customFeeBps ?? null;
     const effectiveBps = customBps !== null ? customBps : generalBps;
 
     return reply.send({
-      platformBps  : effectiveBps,
-      platformPct  : effectiveBps / 100,
-      isCustom     : customBps !== null,
+      platformBps: effectiveBps,
+      platformPct: effectiveBps / 100,
+      isCustom   : customBps !== null,
       generalBps,
     });
   });
 
-  // GET /admin/fees — retorna taxa geral e taxa do adquirente
+  // GET /admin/fees — retorna todas as 15 taxas (PIX, BOLETO, CARD_1X..12X, WITHDRAWAL)
   app.get('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (_req, reply) => {
     const rows = await prisma.platformConfig.findMany({
       where: { key: { startsWith: 'fees.' } },
     });
 
-    const map: Record<string, any> = {};
-    for (const r of rows) map[r.key] = r.value as any;
+    const byKey = new Map<string, any>(rows.map(r => [r.key, r.value]));
+    const fees: Record<FeeType, any> = {} as any;
 
-    const platformBps = map['fees.platform']?.bps ?? 0;
-    const acquirers: Record<string, { cents: number }> = {};
-    for (const acq of ACQUIRERS) {
-      acquirers[acq] = {
-        cents: map[`fees.acquirer.${acq}`]?.cents ?? 0,
-      };
+    for (const type of FEE_TYPES) {
+      const raw = byKey.get(`fees.${type}`);
+      fees[type] = raw && raw.platform && raw.acquirer ? raw : DEFAULT_FEE;
     }
 
-    return reply.send({
-      platformBps,
-      platformPct: platformBps / 100,
-      acquirers,
-    });
+    return reply.send({ fees });
   });
 
-  // POST /admin/fees — atualiza taxa geral e/ou taxas dos adquirentes
+  // POST /admin/fees — bulk update de uma ou mais taxas
   app.post('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
     const body = z.object({
-      platformBps: z.number().int().min(0).max(10000).optional(),
-      acquirers  : z.record(z.enum(ACQUIRERS), z.number().int().min(0)).optional(),
+      fees: z.record(z.enum(FEE_TYPES), feeConfigSchema),
     }).parse(req.body);
 
     const ops: any[] = [];
-
-    if (body.platformBps !== undefined) {
+    for (const [type, cfg] of Object.entries(body.fees)) {
+      const key = `fees.${type}`;
       ops.push(prisma.platformConfig.upsert({
-        where : { key: 'fees.platform' },
-        create: { key: 'fees.platform', value: { bps: body.platformBps } },
-        update: { value: { bps: body.platformBps } },
+        where : { key },
+        create: { key, value: cfg as any },
+        update: { value: cfg as any },
       }));
-    }
-
-    if (body.acquirers) {
-      for (const [acq, cents] of Object.entries(body.acquirers)) {
-        const key = `fees.acquirer.${acq}`;
-        ops.push(prisma.platformConfig.upsert({
-          where : { key },
-          create: { key, value: { cents } },
-          update: { value: { cents } },
-        }));
-      }
     }
 
     await Promise.all(ops);
