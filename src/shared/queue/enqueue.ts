@@ -13,8 +13,17 @@ export async function enqueueEmail(
   template: string,
   data    : Record<string, any>
 ): Promise<void> {
-  await emailQueue.add(template, { to, subject, template, data });
-  logger.debug({ to, template }, 'Queue: email enfileirado');
+  // Fire-and-forget com timeout — se o Redis estiver lento/indisponível,
+  // NÃO bloqueia o fluxo principal (aprovar produtor, webhook, etc).
+  try {
+    await Promise.race([
+      emailQueue.add(template, { to, subject, template, data }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('enqueue timeout')), 3000)),
+    ]);
+    logger.debug({ to, template }, 'Queue: email enfileirado');
+  } catch (err: any) {
+    logger.warn({ to, template, err: err.message }, 'Queue: enqueueEmail falhou (não crítico)');
+  }
 }
 
 export async function enqueueNfe(orderId: string): Promise<void> {
