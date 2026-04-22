@@ -504,12 +504,12 @@ function startLogisticsWorker(): Worker {
     await prisma.shipment.create({
       data: {
         order  : { connect: { id: orderId } },
-        carrier: 'JADLOG',
+        carrier: 'MELHOR_ENVIO',
         status : 'WAITING',
       },
     });
 
-    logger.info({ orderId }, '📦 Logistics worker: shipment WAITING criado — produtor precisa despachar via /logistics/jadlog/ship');
+    logger.info({ orderId }, '📦 Logistics worker: shipment WAITING criado — produtor precisa despachar via /logistics/ship');
   }, { connection: redisConnection });
 
   worker.on('failed', (job, err) => {

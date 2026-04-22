@@ -828,3 +828,25 @@ model TrackingPixel {
 
   @@index([producerId])
 }
+
+// ══════════════════════════════════════════════════════
+// INTEGRAÇÕES DE USUÁRIO (chaves de API por conta)
+// ══════════════════════════════════════════════════════
+// Cada usuário (admin, produtor, afiliado) armazena suas próprias chaves.
+// Providers atuais:
+//   MELHOR_ENVIO → logística/frete
+//   NFE_IO       → emissão de nota fiscal
+
+model UserIntegration {
+  id        String   @id @default(cuid())
+  userId    String
+  provider  String                           // MELHOR_ENVIO | NFE_IO
+  config    Json                             // estrutura livre (apiKey, token, companyId, sandbox, etc.)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, provider])
+  @@index([userId])
+  @@index([provider])
+}

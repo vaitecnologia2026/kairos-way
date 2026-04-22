@@ -5,357 +5,209 @@ import { prisma } from '../../shared/utils/prisma';
 import { logger } from '../../shared/utils/logger';
 import { AuditService } from '../audit/audit.service';
 import { NotFoundError, ForbiddenError, AppError } from '../../shared/errors/AppError';
-import { jadlogService } from '../../shared/services/jadlog.service';
+import { buildMelhorEnvio } from '../../shared/services/melhor-envio.service';
 
 const audit = new AuditService();
 
-// Helper — evita repetir cast em toda rota protegida
-function user(req: any): { sub: string; role: string } {
-  return req.user as any;
+/**
+ * Logística — Melhor Envio
+ * Cada produtor usa suas próprias credenciais armazenadas em UserIntegration.
+ * Cotação (/quote) busca a config do produtor dono da oferta a partir do slug.
+ */
+
+async function getProducerMelhorEnvio(producerUserId: string) {
+  const row = await prisma.userIntegration.findUnique({
+    where: { userId_provider: { userId: producerUserId, provider: 'MELHOR_ENVIO' } },
+  });
+  if (!row || !row.isActive) return null;
+  return buildMelhorEnvio(row.config);
 }
 
 export async function logisticsRoutes(app: FastifyInstance) {
 
-  // ── POST /logistics/quote — calcular frete (Jadlog + fallback) ──
+  // ── POST /logistics/quote — cotação de frete (público, usado no checkout) ──
   app.post('/quote', async (req, reply) => {
     const body = z.object({
-      cepDestino : z.string().min(8, 'CEP deve ter 8 dígitos'),
+      offerSlug  : z.string().optional(),
+      producerId : z.string().optional(),
+      cepDestino : z.string().min(8),
       weightKg   : z.number().positive(),
       valueCents : z.number().int().positive(),
+      heightCm   : z.number().optional(),
+      widthCm    : z.number().optional(),
+      lengthCm   : z.number().optional(),
     }).parse(req.body);
 
-    const cep = body.cepDestino.replace(/\D/g, '');
-
-    // Tenta Jadlog
-    if (await jadlogService.isConfigured()) {
-      try {
-        const opcoes = await jadlogService.simularFreteMultiplo(
-          cep,
-          body.weightKg,
-          body.valueCents / 100,
-        );
-        if (opcoes.length > 0) {
-          return reply.send(opcoes.map(o => ({
-            name         : o.nome,
-            modal        : o.modal,
-            price        : o.valor,
-            delivery_time: o.prazo,
-            modalidade   : o.modalidade,
-            carrier      : 'JADLOG',
-          })));
-        }
-      } catch (err: any) {
-        logger.warn({ err: err.message, cep }, 'Logistics: Jadlog indisponível, usando fallback');
-      }
+    // Descobre o produtor dono do produto para pegar as credenciais
+    let producerUserId: string | null = null;
+    if (body.offerSlug) {
+      const offer = await prisma.offer.findUnique({
+        where  : { slug: body.offerSlug },
+        include: { product: { include: { producer: true } } },
+      });
+      producerUserId = offer?.product?.producer?.userId ?? null;
+    } else if (body.producerId) {
+      producerUserId = body.producerId;
     }
 
-    // Fallback com tabela fixa
-    return reply.send([
-      { name: 'Jadlog .PACKAGE',  price: 18.50, delivery_time: 7, modalidade: 3,  carrier: 'JADLOG' },
-      { name: 'Jadlog ECONÔMICO', price: 14.90, delivery_time: 10, modalidade: 5, carrier: 'JADLOG' },
-      { name: 'Jadlog EXPRESSO',  price: 35.90, delivery_time: 3, modalidade: 0,  carrier: 'JADLOG' },
-    ]);
+    // Credenciais do produtor
+    const svc = producerUserId ? await getProducerMelhorEnvio(producerUserId) : null;
+
+    if (!svc) {
+      // Sem integração — retorna fallback simples para não quebrar o checkout
+      return reply.send([
+        { name: 'Indisponível', company: 'Melhor Envio', priceCents: 0, deliveryDays: 0, error: 'Produtor não configurou Melhor Envio' },
+      ]);
+    }
+
+    try {
+      const quotes = await svc.quote({
+        fromCep   : (svc as any).cfg?.fromCep || process.env.DEFAULT_FROM_CEP || '01310100',
+        toCep     : body.cepDestino,
+        weightKg  : body.weightKg,
+        valueCents: body.valueCents,
+        heightCm  : (body as any).heightCm,
+        widthCm   : (body as any).widthCm,
+        lengthCm  : (body as any).lengthCm,
+      });
+      return reply.send(quotes);
+    } catch (err: any) {
+      logger.warn({ err: err.message }, 'Logistics: falha na cotação Melhor Envio');
+      return reply.status(502).send({ message: 'Falha ao cotar frete', error: err.message });
+    }
   });
 
-  // ── POST /logistics/jadlog/ship — criar pedido na Jadlog ────────
-  app.post('/jadlog/ship', {
+  // ── POST /logistics/ship — criar envio no Melhor Envio ──
+  app.post('/ship', {
     preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
   }, async (req, reply) => {
     const body = z.object({
       orderId    : z.string(),
-      modalidade : z.number().optional(),
+      serviceId  : z.number(),   // id da modalidade retornada por /quote
+      fromAddress: z.record(z.any()),
+      toAddress  : z.record(z.any()),
+      volumes    : z.array(z.record(z.any())).min(1),
     }).parse(req.body);
-
-    if (!await jadlogService.isConfigured()) {
-      throw new AppError('Jadlog não configurada — adicione JADLOG_TOKEN, JADLOG_COD_CLIENTE, JADLOG_CNPJ e JADLOG_CEP_ORIGEM no .env', 503);
-    }
 
     const order = await prisma.order.findUnique({
       where  : { id: body.orderId },
-      include: {
-        offer: { include: { product: { include: { producer: true } } } },
-        shipment: true,
-      },
+      include: { offer: { include: { product: { include: { producer: true } } } } },
     });
 
     if (!order) throw new NotFoundError('Pedido');
     if (order.offer.product.type !== 'PHYSICAL') throw new AppError('Produto não é físico', 422);
-    if (order.status !== 'APPROVED') throw new AppError('Pedido não aprovado', 422);
 
-    // Verificar permissão do produtor
-    if (user(req).role === 'PRODUCER') {
-      const producer = await prisma.producer.findUnique({ where: { userId: user(req).sub } });
-      if (order.offer.product.producerId !== producer?.id) throw new ForbiddenError();
+    const producerUserId = order.offer.product.producer?.userId;
+    if (!producerUserId) throw new AppError('Produtor sem cadastro válido', 500);
+
+    // Permissão
+    if ((req.user as any).role === 'PRODUCER' && producerUserId !== (req.user as any).sub) {
+      throw new ForbiddenError();
     }
 
-    // Endereço do destinatário vem do metadata do pedido
-    const shippingAddr = (order.metadata as any)?.shippingAddress;
-    if (!shippingAddr) {
-      throw new AppError('Endereço de entrega não encontrado no pedido', 422);
-    }
+    const svc = await getProducerMelhorEnvio(producerUserId);
+    if (!svc) throw new AppError('Produtor não configurou Melhor Envio (seção Integrações)', 503);
 
-    // Dados do remetente — lidos da config Jadlog salva pelo admin
-    const jadlogCfg = await prisma.platformConfig.findUnique({ where: { key: 'jadlog' } });
-    const jc: any   = jadlogCfg?.value || {};
-    const remetente = {
-      nome    : jc.remNome     || 'Kairos Way',
-      cnpjCpf : jc.cnpj       || '',
-      endereco: jc.remEndereco || '',
-      numero  : jc.remNumero   || '',
-      bairro  : jc.remBairro   || '',
-      cidade  : jc.remCidade   || '',
-      uf      : jc.remUf       || '',
-      cep     : jc.cepOrigem   || '',
-      email   : jc.remEmail    || '',
-      fone    : jc.remFone     || '',
+    const payload = {
+      service : body.serviceId,
+      from    : body.fromAddress,
+      to      : body.toAddress,
+      volumes : body.volumes,
+      options : { insurance_value: order.amountCents / 100, receipt: false, own_hand: false },
     };
 
-    // Volume estimado — produtor pode configurar no produto futuramente
-    const pesoKg = (order.metadata as any)?.weightKg || 1;
-    const volume = {
-      altura      : (order.metadata as any)?.heightCm  || 10,
-      comprimento : (order.metadata as any)?.lengthCm  || 20,
-      largura     : (order.metadata as any)?.widthCm   || 15,
-      peso        : pesoKg,
-      identificador: order.id.slice(-8).toUpperCase(),
-    };
+    const result = await svc.createShipment(payload);
 
-    const result = await jadlogService.incluirPedido({
-      pedido  : [order.id.slice(-8).toUpperCase()],
-      conteudo: order.offer.product.name.slice(0, 80),
-      totPeso : pesoKg,
-      totValor: order.amountCents / 100,
-      modalidade: body.modalidade,
-      rem: remetente,
-      des: {
-        nome    : order.customerName  || 'Cliente',
-        cnpjCpf : order.customerDoc   || '',
-        endereco: shippingAddr.endereco || shippingAddr.street || '',
-        numero  : shippingAddr.numero   || shippingAddr.number || '',
-        compl   : shippingAddr.compl    || shippingAddr.complement || '',
-        bairro  : shippingAddr.bairro   || shippingAddr.neighborhood || '',
-        cidade  : shippingAddr.cidade   || shippingAddr.city || '',
-        uf      : shippingAddr.uf       || shippingAddr.state || '',
-        cep     : (shippingAddr.cep || shippingAddr.zip || '').replace(/\D/g, ''),
-        email   : order.customerEmail || '',
-        cel     : order.customerPhone || '',
-        fone    : order.customerPhone || '',
-      },
-      volume: [volume],
-    });
-
-    if (result.erro) {
-      throw new AppError(`Jadlog: ${result.erro.descricao} — ${result.erro.detalhe || ''}`, 422);
-    }
-
-    // Criar/atualizar Shipment no banco
     const shipment = await prisma.shipment.upsert({
       where : { orderId: order.id },
       create: {
-        order       : { connect: { id: order.id } },
-        carrier     : 'JADLOG',
-        service     : `Jadlog ${body.modalidade ?? 3}`,
-        trackingCode: result.shipmentId || result.codigo || null,
+        orderId     : order.id,
+        carrier     : 'MELHOR_ENVIO',
+        service     : String(body.serviceId),
+        trackingCode: result.id,
         status      : 'DISPATCHED',
         shippedAt   : new Date(),
-        metadata    : {
-          jadlogCodigo    : result.codigo,
-          jadlogShipmentId: result.shipmentId,
-          etiqueta        : result.etiqueta || null,
-        },
+        metadata    : { melhorEnvio: result },
       },
       update: {
-        carrier     : 'JADLOG',
-        trackingCode: result.shipmentId || result.codigo || null,
+        carrier     : 'MELHOR_ENVIO',
+        trackingCode: result.id,
         status      : 'DISPATCHED',
         shippedAt   : new Date(),
-        metadata    : {
-          jadlogCodigo    : result.codigo,
-          jadlogShipmentId: result.shipmentId,
-          etiqueta        : result.etiqueta || null,
-        },
+        metadata    : { melhorEnvio: result },
       },
     });
 
     await audit.log({
-      userId  : user(req).sub,
-      action  : 'JADLOG_SHIP_CREATED',
+      userId  : (req.user as any).sub,
+      action  : 'MELHOR_ENVIO_SHIP_CREATED',
       resource: `order:${order.id}`,
-      details : { jadlogCodigo: result.codigo, jadlogShipmentId: result.shipmentId },
+      details : { shipmentMeId: result.id },
       level   : 'MEDIUM',
     });
 
-    logger.info({ orderId: order.id, jadlogCodigo: result.codigo }, 'Logistics: pedido enviado para Jadlog');
-
-    return reply.status(201).send({
-      shipment,
-      jadlog: {
-        codigo    : result.codigo,
-        shipmentId: result.shipmentId,
-        status    : result.status,
-        etiqueta  : result.etiqueta,
-      },
-    });
+    return reply.status(201).send({ shipment, melhorEnvio: result });
   });
 
-  // ── POST /logistics/jadlog/cancel — cancelar pedido Jadlog ──────
-  app.post('/jadlog/cancel', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
-  }, async (req, reply) => {
-    const body = z.object({
-      orderId: z.string(),
-    }).parse(req.body);
-
-    const shipment = await prisma.shipment.findFirst({ where: { orderId: body.orderId } });
-    if (!shipment) throw new NotFoundError('Envio');
-
-    const meta = shipment.metadata as any;
-    if (!meta?.jadlogShipmentId && !meta?.jadlogCodigo) {
-      throw new AppError('Pedido não possui referência Jadlog', 422);
-    }
-
-    const result = await jadlogService.cancelarPedido({
-      shipmentId: meta.jadlogShipmentId,
-      codigo    : meta.jadlogCodigo,
-    });
-
-    await prisma.shipment.update({
-      where: { id: shipment.id },
-      data : { status: 'RETURNED', returnedAt: new Date() },
-    });
-
-    logger.info({ orderId: body.orderId }, 'Logistics: pedido Jadlog cancelado');
-    return reply.send(result);
-  });
-
-  // ── GET /logistics/tracking/:orderId — tracking Jadlog ──────────
+  // ── GET /logistics/tracking/:orderId — tracking do envio ──
   app.get('/tracking/:orderId', async (req, reply) => {
     const { orderId } = req.params as { orderId: string };
 
     const shipment = await prisma.shipment.findFirst({
       where  : { orderId },
-      include: { order: { select: { customerEmail: true, customerName: true } } },
+      include: { order: { include: { offer: { include: { product: { include: { producer: true } } } } } } },
     });
-
     if (!shipment) throw new NotFoundError('Envio');
 
-    // Se tem referência Jadlog e a integração está configurada, busca tracking atualizado
-    const meta = shipment.metadata as any;
-    const jadlogRef = meta?.jadlogShipmentId || meta?.jadlogCodigo;
+    const producerUserId = shipment.order?.offer?.product?.producer?.userId;
+    const svc = producerUserId ? await getProducerMelhorEnvio(producerUserId) : null;
 
-    if (jadlogRef && await jadlogService.isConfigured()) {
+    if (svc && shipment.trackingCode) {
       try {
-        const tracking = await jadlogService.consultarTracking({
-          shipmentId: meta.jadlogShipmentId,
-          codigo    : meta.jadlogCodigo,
+        const tracking = await svc.tracking([shipment.trackingCode]);
+        const meta = (shipment.metadata as any) || {};
+        await prisma.shipment.update({
+          where: { id: shipment.id },
+          data : { metadata: { ...meta, tracking } },
         });
-
-        const item = tracking.consulta?.[0];
-        if (item?.tracking) {
-          // Atualizar status no banco
-          const newStatus = jadlogService.mapStatusToPrisma(item.tracking.status);
-          const updateData: any = { status: newStatus };
-          if (newStatus === 'DELIVERED' && !shipment.deliveredAt) updateData.deliveredAt = new Date();
-          if (item.previsaoEntrega) updateData.estimatedAt = new Date(item.previsaoEntrega);
-
-          await prisma.shipment.update({
-            where: { id: shipment.id },
-            data : {
-              ...updateData,
-              metadata: {
-                ...(shipment.metadata as any),
-                jadlogTracking: item.tracking,
-                previsaoEntrega: item.previsaoEntrega,
-              },
-            },
-          });
-
-          return reply.send({
-            ...shipment,
-            status         : newStatus,
-            estimatedAt    : item.previsaoEntrega || shipment.estimatedAt,
-            deliveredAt    : newStatus === 'DELIVERED' ? (shipment.deliveredAt || new Date()) : shipment.deliveredAt,
-            jadlogTracking : item.tracking,
-            previsaoEntrega: item.previsaoEntrega,
-          });
-        }
+        return reply.send({ ...shipment, tracking });
       } catch (err: any) {
-        logger.warn({ orderId, err: err.message }, 'Logistics: falha ao consultar tracking Jadlog — retornando dados locais');
+        logger.warn({ orderId, err: err.message }, 'Logistics: falha ao consultar tracking');
       }
     }
 
-    // Fallback: retorna dados locais do banco
-    return reply.send({
-      ...shipment,
-      jadlogTracking: meta?.jadlogTracking || null,
-      previsaoEntrega: meta?.previsaoEntrega || null,
-    });
+    return reply.send(shipment);
   });
 
-  // ── GET /logistics/orders — pedidos físicos (produtor/admin) ────
+  // ── GET /logistics/orders — pedidos físicos do produtor/admin ──
   app.get('/orders', {
     preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
   }, async (req, reply) => {
     const { page = '1', limit = '20', status } = req.query as any;
     const skip = (Number(page) - 1) * Number(limit);
 
-    const where: any = {};
+    const where: any = { offer: { product: { type: 'PHYSICAL' } } };
     if (status) where.status = status;
 
-    if (user(req).role === 'PRODUCER') {
-      const producer = await prisma.producer.findUnique({ where: { userId: user(req).sub } });
+    if ((req.user as any).role === 'PRODUCER') {
+      const producer = await prisma.producer.findUnique({ where: { userId: (req.user as any).sub } });
       if (!producer) return reply.send({ data: [], total: 0 });
-      where.order = { offer: { product: { producerId: producer.id } } };
+      where.offer.product.producerId = producer.id;
     }
 
     const [data, total] = await Promise.all([
-      prisma.shipment.findMany({
+      prisma.order.findMany({
         where,
         include: {
-          order: { select: { customerName: true, customerEmail: true, amountCents: true, id: true } },
+          offer   : { include: { product: { select: { name: true, weightGrams: true } } } },
+          shipment: true,
         },
         orderBy: { createdAt: 'desc' },
         skip, take: Number(limit),
       }),
-      prisma.shipment.count({ where }),
+      prisma.order.count({ where }),
     ]);
 
-    return reply.send({ data, total, page: Number(page), limit: Number(limit) });
-  });
-
-  // ── POST /logistics/orders/:id/dispatch — despacho manual ───────
-  app.post('/orders/:id/dispatch', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
-  }, async (req, reply) => {
-    const { id } = req.params as { id: string };
-    const body   = z.object({
-      carrier     : z.string().min(2),
-      trackingCode: z.string().optional(),
-      labelUrl    : z.string().url().optional(),
-    }).parse(req.body);
-
-    if (user(req).role === 'PRODUCER') {
-      const producer = await prisma.producer.findUnique({ where: { userId: user(req).sub } });
-      const order    = await prisma.order.findUnique({
-        where  : { id },
-        include: { offer: { include: { product: { select: { producerId: true } } } } },
-      });
-      if (order?.offer.product.producerId !== producer?.id) throw new ForbiddenError();
-    }
-
-    const shipment = await prisma.shipment.upsert({
-      where : { orderId: id },
-      create: { order: { connect: { id } }, carrier: body.carrier, trackingCode: body.trackingCode, labelUrl: body.labelUrl, status: 'DISPATCHED', shippedAt: new Date() },
-      update: { carrier: body.carrier, trackingCode: body.trackingCode, labelUrl: body.labelUrl, status: 'DISPATCHED', shippedAt: new Date() },
-    });
-
-    await audit.log({
-      userId  : user(req).sub,
-      action  : 'ORDER_DISPATCHED',
-      resource: `order:${id}`,
-      level   : 'LOW',
-    });
-
-    return reply.send(shipment);
+    return reply.send({ data, total });
   });
 }

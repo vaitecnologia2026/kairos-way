@@ -34,6 +34,7 @@ import { customerRoutes }       from './modules/customer/customer.routes';
 import { notificationRoutes }   from './modules/notifications/notifications.routes';
 import { milestoneRoutes }      from './modules/producers/milestones.routes';
 import { trackingRoutes }       from './modules/tracking/tracking.routes';
+import { integrationsRoutes }   from './modules/integrations/integrations.routes';
 
 // Queue workers
 import { startWorkers } from './shared/queue/workers';
@@ -148,6 +149,7 @@ async function bootstrap() {
   await app.register(notificationRoutes, { prefix: '/notifications' });
   await app.register(milestoneRoutes,    { prefix: '/producers/milestones' });
   await app.register(trackingRoutes,     { prefix: '/tracking' });
+  await app.register(integrationsRoutes, { prefix: '/integrations' });
 
   // ── START QUEUE WORKERS ──────────────────────────────────────
   await startWorkers();

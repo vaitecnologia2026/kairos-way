@@ -30,19 +30,31 @@ export interface NFeResult {
   issuedAt   : string;
 }
 
-export class NFeIoService {
-  private readonly api    : AxiosInstance;
-  private readonly companyId: string;
+export interface NFeIoConfig {
+  apiKey          : string;
+  companyId       : string;
+  cityServiceCode?: string;
+}
 
-  constructor() {
-    const apiKey    = process.env.NFEIO_API_KEY;
-    const companyId = process.env.NFEIO_COMPANY_ID;
+export class NFeIoService {
+  private readonly api      : AxiosInstance;
+  private readonly companyId: string;
+  private readonly cfg      : NFeIoConfig;
+
+  /**
+   * Aceita config por parâmetro (credenciais por usuário) ou fallback
+   * para variáveis de ambiente.
+   */
+  constructor(config?: NFeIoConfig) {
+    const apiKey    = config?.apiKey    ?? process.env.NFEIO_API_KEY;
+    const companyId = config?.companyId ?? process.env.NFEIO_COMPANY_ID;
 
     if (!apiKey || !companyId) {
-      logger.warn('NFEIO_API_KEY ou NFEIO_COMPANY_ID não configurados — emissão de NF-e desabilitada');
+      logger.warn('NFe.io sem credenciais — emissão desabilitada');
     }
 
     this.companyId = companyId || '';
+    this.cfg       = { apiKey: apiKey || '', companyId: companyId || '', cityServiceCode: config?.cityServiceCode };
 
     this.api = axios.create({
       baseURL: 'https://api.nfe.io/v1',
@@ -53,6 +65,20 @@ export class NFeIoService {
       },
       timeout: 30_000,
     });
+  }
+
+  /** Verifica credenciais buscando dados da empresa. */
+  async testConnection(): Promise<{ ok: true; company: any } | { ok: false; error: string }> {
+    if (!this.companyId || !this.cfg.apiKey) {
+      return { ok: false, error: 'API key ou Company ID ausentes' };
+    }
+    try {
+      const { data } = await this.api.get(`/companies/${this.companyId}`);
+      return { ok: true, company: data };
+    } catch (err: any) {
+      logger.warn({ err: err?.response?.data || err.message }, 'NFe.io: testConnection falhou');
+      return { ok: false, error: err?.response?.data?.message || 'Credenciais inválidas' };
+    }
   }
 
   /**
@@ -66,7 +92,7 @@ export class NFeIoService {
 
     // Construir payload conforme spec NFe.io v1
     const payload = {
-      cityServiceCode : process.env.NFEIO_CITY_SERVICE_CODE || '01.07',    // código de serviço municipal
+      cityServiceCode : this.cfg.cityServiceCode || process.env.NFEIO_CITY_SERVICE_CODE || '01.07',    // código de serviço municipal
       description     : input.description || `${input.productName} — Pedido #${input.orderId.slice(-8).toUpperCase()}`,
       servicesAmount  : input.amountCents / 100,
       borrower        : {
@@ -151,4 +177,13 @@ export class NFeIoService {
 
     return {}; // documento ausente ou formato inválido — emite sem documento
   }
+}
+/** Helper para instanciar a partir da config salva em UserIntegration. */
+export function buildNFeIo(config: any): NFeIoService | null {
+  if (!config?.apiKey || !config?.companyId) return null;
+  return new NFeIoService({
+    apiKey          : config.apiKey,
+    companyId       : config.companyId,
+    cityServiceCode : config.cityServiceCode,
+  });
 }
