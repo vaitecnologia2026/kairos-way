@@ -109,16 +109,17 @@ export async function checkoutRoutes(app: FastifyInstance) {
     // a config atual. Mudanças futuras na taxa geral NÃO afetarão este pedido.
     let appliedFees: any = null;
     try {
-      const { snapshotFeeForTransaction, paymentToFeeMethod } = await import('../../shared/services/fees.service');
+      const { snapshotFeeForTransaction } = await import('../../shared/services/fees.service');
       const producer = await prisma.producer.findFirst({
         where : { id: offer.product.producerId },
         select: { userId: true },
       });
       if (producer?.userId) {
         appliedFees = await snapshotFeeForTransaction({
-          userId   : producer.userId,
-          method   : paymentToFeeMethod(body.method),
-          saleCents: offer.priceCents,
+          userId       : producer.userId,
+          paymentMethod: body.method,
+          installments : body.installments ?? 1,
+          saleCents    : offer.priceCents,
         });
       }
     } catch (err: any) {

@@ -3,141 +3,202 @@ import { prisma } from '../utils/prisma';
 /**
  * Sistema de taxas da plataforma.
  *
- * Métodos de pagamento:
- *   PIX, BOLETO, CARD, WITHDRAWAL
+ * ARQUITETURA:
+ * - Plataforma cobra 4 métodos simples: PIX, BOLETO, CARD, WITHDRAWAL
+ * - Adquirente (Pagar.me) cobra granular: PIX, BOLETO, CARD_1X..CARD_12X, WITHDRAWAL
+ * - Custos fixos adicionais do adquirente em toda transação de cartão:
+ *   CARD_GATEWAY + CARD_ANTIFRAUDE
  *
- * Cada FeePart pode conter bps (% em basis points) E/OU cents (R$ fixo).
- * Ambos opcionais — podem existir juntos (ex: 3,80% + R$ 3,00).
+ * FeePart é exclusivo: mode = 'PERCENT' (bps) OU 'FIXED' (cents).
  *
- * Lógica de resolução:
- *   1. Se o usuário (produtor/afiliado) tiver customFees[method] preenchido → usa ele
- *   2. Caso contrário → usa taxa geral da plataforma
+ * Lógica de resolução da taxa da plataforma:
+ *   1. Se o usuário tem customFees[PLATFORM_METHOD] preenchido → usa ele
+ *   2. Caso contrário → usa a taxa geral
  *
- * A taxa aplicada é "fotografada" (snapshot) em Order.appliedFees no momento
- * da transação. Mudanças futuras não afetam transações antigas.
+ * Adquirente não é customizável por usuário (é o custo real).
+ *
+ * Snapshot: cada Order salva em appliedFees a taxa fotografada no momento
+ * da transação. Mudanças futuras não afetam vendas antigas.
  */
 
-export const FEE_METHODS = ['PIX', 'BOLETO', 'CARD', 'WITHDRAWAL'] as const;
-export type FeeMethod = typeof FEE_METHODS[number];
+// ── Métodos que a PLATAFORMA cobra do produtor/afiliado ──
+export const PLATFORM_METHODS = ['PIX', 'BOLETO', 'CARD', 'WITHDRAWAL'] as const;
+export type PlatformMethod = typeof PLATFORM_METHODS[number];
+
+// ── Métodos no lado do ADQUIRENTE ──
+const CARD_INSTALLMENTS = Array.from({ length: 12 }, (_, i) => `CARD_${i + 1}X` as const);
+export const ACQUIRER_METHODS = [
+  'PIX', 'BOLETO',
+  ...CARD_INSTALLMENTS,
+  'CARD_GATEWAY',     // custo fixo somado a qualquer cartão (ex: R$0,55)
+  'CARD_ANTIFRAUDE',  // custo fixo somado a qualquer cartão (ex: R$0,44)
+  'WITHDRAWAL',
+] as const;
+export type AcquirerMethod = typeof ACQUIRER_METHODS[number];
+
+export type CardInstallment = typeof CARD_INSTALLMENTS[number];
 
 export interface FeePart {
-  bps?  : number;  // % em basis points (1% = 100)
-  cents?: number;  // R$ em centavos (R$ 1,00 = 100)
+  mode : 'PERCENT' | 'FIXED';
+  value: number;  // bps se PERCENT, cents se FIXED
 }
 
-export interface FeeConfig {
-  platform: FeePart;
-  acquirer: FeePart;
-}
+export const EMPTY_PART: FeePart = { mode: 'PERCENT', value: 0 };
 
-export const EMPTY_PART  : FeePart   = {};
-export const EMPTY_CONFIG: FeeConfig = { platform: EMPTY_PART, acquirer: EMPTY_PART };
-
-/** Normaliza um FeePart: remove zeros/undefined, retorna {} se vazio. */
-export function normalizePart(p?: FeePart | null): FeePart {
-  if (!p) return {};
-  const out: FeePart = {};
-  if (typeof p.bps   === 'number' && p.bps   > 0) out.bps   = Math.floor(p.bps);
-  if (typeof p.cents === 'number' && p.cents > 0) out.cents = Math.floor(p.cents);
-  return out;
-}
-
-/** Retorna true se o FeePart tem pelo menos um valor definido. */
 export function isFilled(p?: FeePart | null): boolean {
-  if (!p) return false;
-  return (typeof p.bps === 'number' && p.bps > 0) || (typeof p.cents === 'number' && p.cents > 0);
+  return !!p && p.value > 0;
 }
 
-/** Calcula quanto em centavos uma FeePart representa sobre uma venda. */
+export function normalizePart(p?: any): FeePart {
+  if (!p || typeof p !== 'object') return EMPTY_PART;
+  const mode = p.mode === 'FIXED' ? 'FIXED' : 'PERCENT';
+  const value = typeof p.value === 'number' && p.value >= 0 ? Math.floor(p.value) : 0;
+  return { mode, value };
+}
+
+/** Quanto uma FeePart representa em centavos sobre uma venda. */
 export function partToCents(p: FeePart, saleCents: number): number {
-  const fromPct = p.bps   ? Math.round(saleCents * p.bps / 10000) : 0;
-  const fromFix = p.cents ?? 0;
-  return fromPct + fromFix;
+  if (p.mode === 'PERCENT') return Math.round(saleCents * p.value / 10000);
+  return p.value;
 }
 
-/**
- * Retorna a taxa geral da plataforma para todos os métodos.
- * Lê PlatformConfig (keys: fees.PIX, fees.BOLETO, fees.CARD, fees.WITHDRAWAL).
- */
-export async function getPlatformFees(): Promise<Record<FeeMethod, FeeConfig>> {
+// ── Config da plataforma ──
+export async function getPlatformFees(): Promise<Record<PlatformMethod, FeePart>> {
   const rows = await prisma.platformConfig.findMany({
-    where: { key: { startsWith: 'fees.' } },
+    where: { key: { startsWith: 'fees.platform.' } },
   });
   const byKey = new Map(rows.map(r => [r.key, r.value as any]));
-
-  const out: Record<FeeMethod, FeeConfig> = {} as any;
-  for (const m of FEE_METHODS) {
-    const raw = byKey.get(`fees.${m}`);
-    out[m] = {
-      platform: normalizePart(raw?.platform),
-      acquirer: normalizePart(raw?.acquirer),
-    };
+  const out: Record<PlatformMethod, FeePart> = {} as any;
+  for (const m of PLATFORM_METHODS) {
+    out[m] = normalizePart(byKey.get(`fees.platform.${m}`));
   }
   return out;
 }
 
+// ── Config do adquirente ──
+export async function getAcquirerFees(): Promise<Record<AcquirerMethod, FeePart>> {
+  const rows = await prisma.platformConfig.findMany({
+    where: { key: { startsWith: 'fees.acquirer.' } },
+  });
+  const byKey = new Map(rows.map(r => [r.key, r.value as any]));
+  const out: Record<AcquirerMethod, FeePart> = {} as any;
+  for (const m of ACQUIRER_METHODS) {
+    out[m] = normalizePart(byKey.get(`fees.acquirer.${m}`));
+  }
+  return out;
+}
+
+/** Mapeia PaymentMethod + installments para o método da plataforma. */
+export function paymentToPlatformMethod(pm?: string | null): PlatformMethod {
+  if (pm === 'PIX') return 'PIX';
+  if (pm === 'BOLETO') return 'BOLETO';
+  return 'CARD';
+}
+
+/** Mapeia PaymentMethod + installments para o método principal do adquirente. */
+export function paymentToAcquirerMethod(pm?: string | null, installments = 1): AcquirerMethod {
+  if (pm === 'PIX') return 'PIX';
+  if (pm === 'BOLETO') return 'BOLETO';
+  // Cartão — usa a parcela específica (1-12)
+  const n = Math.min(12, Math.max(1, installments));
+  return `CARD_${n}X` as AcquirerMethod;
+}
+
 /**
- * Resolve a taxa efetiva de um usuário para um método específico.
- * Se o usuário tiver customFees[method] preenchido, usa ele (substitui a geral).
- * Caso contrário, usa a taxa geral.
- *
- * A taxa do adquirente vem sempre da config geral — não é customizável por usuário.
+ * Resolve a taxa efetiva da plataforma para um usuário num método simples.
+ * Custom fees substituem por método se preenchidas.
  */
-export async function resolveEffectiveFee(userId: string, method: FeeMethod): Promise<{
-  platform: FeePart;
-  acquirer: FeePart;
+export async function resolvePlatformFee(userId: string, method: PlatformMethod): Promise<{
+  part    : FeePart;
   isCustom: boolean;
 }> {
-  const [producer, affiliate, platformFees] = await Promise.all([
+  const [producer, affiliate, platform] = await Promise.all([
     prisma.producer .findUnique({ where: { userId }, select: { customFees: true } }),
     prisma.affiliate.findUnique({ where: { userId }, select: { customFees: true } }),
     getPlatformFees(),
   ]);
 
-  const customFees = (producer?.customFees ?? affiliate?.customFees ?? null) as Partial<Record<FeeMethod, FeePart>> | null;
+  const customFees = (producer?.customFees ?? affiliate?.customFees ?? null) as Partial<Record<PlatformMethod, FeePart>> | null;
   const customPart = customFees?.[method];
   const hasCustom  = isFilled(customPart);
 
-  const base       = platformFees[method];
-  const platform   = hasCustom ? normalizePart(customPart) : base.platform;
-  const acquirer   = base.acquirer;
-
-  return { platform, acquirer, isCustom: hasCustom };
-}
-
-/**
- * "Fotografa" a taxa aplicada a uma transação para persistir em Order.appliedFees.
- */
-export async function snapshotFeeForTransaction(params: {
-  userId    : string;
-  method    : FeeMethod;
-  saleCents : number;
-}): Promise<{
-  method       : FeeMethod;
-  platform     : FeePart;
-  acquirer     : FeePart;
-  platformCents: number; // quanto a plataforma cobrou do produtor
-  acquirerCents: number; // quanto a plataforma paga ao adquirente
-  marginCents  : number; // lucro da plataforma (platform − acquirer)
-  isCustom     : boolean;
-}> {
-  const { platform, acquirer, isCustom } = await resolveEffectiveFee(params.userId, params.method);
-  const platformCents = partToCents(platform, params.saleCents);
-  const acquirerCents = partToCents(acquirer, params.saleCents);
   return {
-    method       : params.method,
-    platform,
-    acquirer,
-    platformCents,
-    acquirerCents,
-    marginCents  : platformCents - acquirerCents,
-    isCustom,
+    part    : hasCustom ? normalizePart(customPart) : platform[method],
+    isCustom: hasCustom,
   };
 }
 
-/** Mapeia PaymentMethod (enum do schema) para FeeMethod. */
-export function paymentToFeeMethod(pm?: string | null): FeeMethod {
-  if (pm === 'PIX') return 'PIX';
-  if (pm === 'BOLETO') return 'BOLETO';
-  return 'CARD'; // CREDIT_CARD, DEBIT_CARD, default
+/**
+ * Calcula o custo TOTAL do adquirente para uma transação.
+ * Para cartão: MDR da parcela + Gateway + Antifraude.
+ */
+export async function computeAcquirerCost(params: {
+  paymentMethod: string | null;
+  installments : number;
+  saleCents    : number;
+}): Promise<{
+  breakdown: Array<{ label: string; part: FeePart; cents: number }>;
+  totalCents: number;
+}> {
+  const acq = await getAcquirerFees();
+  const out: Array<{ label: string; part: FeePart; cents: number }> = [];
+  const pm  = params.paymentMethod || '';
+
+  if (pm === 'PIX') {
+    const p = acq.PIX;
+    out.push({ label: 'PIX', part: p, cents: partToCents(p, params.saleCents) });
+  } else if (pm === 'BOLETO') {
+    const p = acq.BOLETO;
+    out.push({ label: 'Boleto', part: p, cents: partToCents(p, params.saleCents) });
+  } else {
+    // Cartão — MDR da parcela + Gateway + Antifraude
+    const n = Math.min(12, Math.max(1, params.installments));
+    const mdrKey = `CARD_${n}X` as AcquirerMethod;
+    const mdr  = acq[mdrKey];
+    const gw   = acq.CARD_GATEWAY;
+    const af   = acq.CARD_ANTIFRAUDE;
+    out.push({ label: `MDR ${n}x`,    part: mdr, cents: partToCents(mdr, params.saleCents) });
+    if (isFilled(gw)) out.push({ label: 'Gateway',    part: gw, cents: partToCents(gw, params.saleCents) });
+    if (isFilled(af)) out.push({ label: 'Antifraude', part: af, cents: partToCents(af, params.saleCents) });
+  }
+
+  const totalCents = out.reduce((s, x) => s + x.cents, 0);
+  return { breakdown: out, totalCents };
+}
+
+/**
+ * Fotografa a taxa aplicada a uma transação para persistir em Order.appliedFees.
+ */
+export async function snapshotFeeForTransaction(params: {
+  userId       : string;
+  paymentMethod: string | null;
+  installments : number;
+  saleCents    : number;
+}): Promise<{
+  platformMethod: PlatformMethod;
+  platformPart  : FeePart;
+  platformCents : number;
+  acquirer      : { breakdown: Array<{ label: string; part: FeePart; cents: number }>; totalCents: number };
+  marginCents   : number;
+  isCustom      : boolean;
+}> {
+  const platformMethod = paymentToPlatformMethod(params.paymentMethod);
+  const [platformRes, acquirer] = await Promise.all([
+    resolvePlatformFee(params.userId, platformMethod),
+    computeAcquirerCost({
+      paymentMethod: params.paymentMethod,
+      installments : params.installments,
+      saleCents    : params.saleCents,
+    }),
+  ]);
+
+  const platformCents = partToCents(platformRes.part, params.saleCents);
+  return {
+    platformMethod,
+    platformPart  : platformRes.part,
+    platformCents,
+    acquirer,
+    marginCents   : platformCents - acquirer.totalCents,
+    isCustom      : platformRes.isCustom,
+  };
 }

@@ -131,40 +131,37 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ══════════════════════════════════════════════════════════════════
-  // TAXAS E COMISSÕES (v2) — estrutura oficial
+  // TAXAS E COMISSÕES (v3) — modelo Pagar.me
   // ══════════════════════════════════════════════════════════════════
-  // 4 métodos: PIX, BOLETO, CARD, WITHDRAWAL
-  // Cada taxa: { platform: {bps?, cents?}, acquirer: {bps?, cents?} }
-  //   → bps (% em basis points) e cents (R$ fixo) podem coexistir
+  // Plataforma (4 métodos): PIX, BOLETO, CARD, WITHDRAWAL
+  // Adquirente (15 métodos): PIX, BOLETO, CARD_1X..CARD_12X,
+  //                          CARD_GATEWAY, CARD_ANTIFRAUDE, WITHDRAWAL
   //
-  // Taxa personalizada por usuário:
-  //   Producer.customFees / Affiliate.customFees = Partial<Record<Method, FeePart>>
-  //   Se customFees[method] existe → substitui a taxa da plataforma para esse método
-  //   Caso contrário → herda taxa geral
+  // Cada FeePart: { mode: 'PERCENT' | 'FIXED', value: number }
+  //   PERCENT → value em basis points (1% = 100)
+  //   FIXED   → value em cents (R$ 1,00 = 100)
   //
-  // A taxa do adquirente NÃO é customizável por usuário — vem só da config geral.
-  //
-  // Snapshot: cada Order salva em appliedFees a taxa aplicada no momento da venda.
+  // Taxa personalizada por usuário (por método simples): PIX, BOLETO, CARD, WITHDRAWAL
+  // Se customFees[method] existe → substitui a geral desse método
 
-  const FEE_METHODS_LOCAL = ['PIX', 'BOLETO', 'CARD', 'WITHDRAWAL'] as const;
+  const PLATFORM_METHODS_LOCAL = ['PIX', 'BOLETO', 'CARD', 'WITHDRAWAL'] as const;
+  const CARD_INST_KEYS = Array.from({ length: 12 }, (_, i) => `CARD_${i + 1}X` as const);
+  const ACQUIRER_METHODS_LOCAL = [
+    'PIX', 'BOLETO', ...CARD_INST_KEYS, 'CARD_GATEWAY', 'CARD_ANTIFRAUDE', 'WITHDRAWAL',
+  ] as const;
 
   const feePartSchema = z.object({
-    bps  : z.number().int().min(0).optional(),
-    cents: z.number().int().min(0).optional(),
+    mode : z.enum(['PERCENT', 'FIXED']),
+    value: z.number().int().min(0),
   });
 
-  const feeConfigSchema = z.object({
-    platform: feePartSchema,
-    acquirer: feePartSchema,
-  });
+  const EMPTY_PART = { mode: 'PERCENT' as const, value: 0 };
 
-  const EMPTY_FEE = { platform: {}, acquirer: {} };
-
-  // GET /admin/platform-fee — taxa PIX padrão (compat legado, usa PIX como default visual)
+  // GET /admin/platform-fee — taxa PIX do usuário logado (compat legado)
   app.get('/platform-fee', { preHandler: [authenticate] }, async (req, reply) => {
-    const { resolveEffectiveFee } = await import('../../shared/services/fees.service');
-    const pix = await resolveEffectiveFee(req.user.sub, 'PIX');
-    const bps = pix.platform.bps ?? 0;
+    const { resolvePlatformFee } = await import('../../shared/services/fees.service');
+    const pix = await resolvePlatformFee(req.user.sub, 'PIX');
+    const bps = pix.part.mode === 'PERCENT' ? pix.part.value : 0;
     return reply.send({
       platformBps: bps,
       platformPct: bps / 100,
@@ -172,45 +169,66 @@ export async function adminRoutes(app: FastifyInstance) {
     });
   });
 
-  // GET /admin/fees — taxa geral (4 métodos)
+  // GET /admin/fees — taxa geral (plataforma 4 + adquirente 15)
   app.get('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (_req, reply) => {
     const rows = await prisma.platformConfig.findMany({
       where: { key: { startsWith: 'fees.' } },
     });
     const byKey = new Map<string, any>(rows.map(r => [r.key, r.value]));
-    const fees: Record<string, any> = {};
-    for (const m of FEE_METHODS_LOCAL) {
-      const raw = byKey.get(`fees.${m}`);
-      fees[m] = raw && raw.platform !== undefined ? raw : EMPTY_FEE;
+
+    const platform: Record<string, any> = {};
+    for (const m of PLATFORM_METHODS_LOCAL) {
+      const raw = byKey.get(`fees.platform.${m}`);
+      platform[m] = raw && typeof raw.mode === 'string' ? raw : EMPTY_PART;
     }
-    return reply.send({ fees });
+
+    const acquirer: Record<string, any> = {};
+    for (const m of ACQUIRER_METHODS_LOCAL) {
+      const raw = byKey.get(`fees.acquirer.${m}`);
+      acquirer[m] = raw && typeof raw.mode === 'string' ? raw : EMPTY_PART;
+    }
+
+    return reply.send({ platform, acquirer });
   });
 
-  // POST /admin/fees — bulk update
+  // POST /admin/fees — bulk update (platform e/ou acquirer)
   app.post('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
     const body = z.object({
-      fees: z.record(z.enum(FEE_METHODS_LOCAL), feeConfigSchema),
+      platform: z.record(z.enum(PLATFORM_METHODS_LOCAL), feePartSchema).optional(),
+      acquirer: z.record(z.enum(ACQUIRER_METHODS_LOCAL), feePartSchema).optional(),
     }).parse(req.body);
 
     const ops: any[] = [];
-    for (const [method, cfg] of Object.entries(body.fees)) {
-      const key = `fees.${method}`;
-      ops.push(prisma.platformConfig.upsert({
-        where : { key },
-        create: { key, value: cfg as any },
-        update: { value: cfg as any },
-      }));
+    if (body.platform) {
+      for (const [method, part] of Object.entries(body.platform)) {
+        const key = `fees.platform.${method}`;
+        ops.push(prisma.platformConfig.upsert({
+          where : { key },
+          create: { key, value: part as any },
+          update: { value: part as any },
+        }));
+      }
+    }
+    if (body.acquirer) {
+      for (const [method, part] of Object.entries(body.acquirer)) {
+        const key = `fees.acquirer.${method}`;
+        ops.push(prisma.platformConfig.upsert({
+          where : { key },
+          create: { key, value: part as any },
+          update: { value: part as any },
+        }));
+      }
     }
     await Promise.all(ops);
 
     await audit.log({
       userId : req.user.sub,
       action : 'FEES_UPDATED',
-      details: body as any,
+      details: { platformKeys: Object.keys(body.platform || {}), acquirerKeys: Object.keys(body.acquirer || {}) },
       level  : 'HIGH',
     });
 
-    logger.info({ methods: Object.keys(body.fees), by: req.user.sub }, 'Admin: taxas atualizadas');
+    logger.info({ by: req.user.sub }, 'Admin: taxas atualizadas');
     return reply.send({ message: 'Taxas atualizadas' });
   });
 
@@ -260,11 +278,11 @@ export async function adminRoutes(app: FastifyInstance) {
     return reply.send({ data: rows, total: rows.length });
   });
 
-  // PUT /admin/fees/users/:userId — taxa personalizada por método (granular)
+  // PUT /admin/fees/users/:userId — taxa personalizada por método (PIX, BOLETO, CARD, WITHDRAWAL)
   app.put('/fees/users/:userId', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
     const { userId } = req.params as { userId: string };
     const body = z.object({
-      customFees: z.record(z.enum(FEE_METHODS_LOCAL), feePartSchema).nullable(),
+      customFees: z.record(z.enum(PLATFORM_METHODS_LOCAL), feePartSchema).nullable(),
     }).parse(req.body);
 
     const [producer, affiliate] = await Promise.all([
