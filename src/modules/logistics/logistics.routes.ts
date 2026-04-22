@@ -239,7 +239,31 @@ export async function logisticsRoutes(app: FastifyInstance) {
       },
     };
 
-    const result = await svc.createShipment(payload);
+    let result: any;
+    try {
+      result = await svc.createShipment(payload);
+    } catch (err: any) {
+      const me = err?.response?.data;
+      logger.error({
+        orderId: order.id,
+        status : err?.response?.status,
+        data   : me,
+        payload,
+      }, 'Logistics: Melhor Envio rejeitou o createShipment');
+      // Extrai mensagem legível do ME
+      const friendly = me?.message
+        || (me?.errors && typeof me.errors === 'object'
+              ? Object.entries(me.errors).map(([k, v]) => `${k}: ${(Array.isArray(v) ? v.join(', ') : v)}`).join(' | ')
+              : null)
+        || err.message
+        || 'Falha ao criar envio no Melhor Envio';
+      throw new AppError(friendly, 422);
+    }
+
+    if (!result?.id) {
+      logger.error({ orderId: order.id, result }, 'Logistics: Melhor Envio retornou sem id');
+      throw new AppError('Melhor Envio retornou resposta inválida', 502);
+    }
 
     const shipment = await prisma.shipment.upsert({
       where : { orderId: order.id },
