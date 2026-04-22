@@ -39,27 +39,30 @@ export type AcquirerMethod = typeof ACQUIRER_METHODS[number];
 export type CardInstallment = typeof CARD_INSTALLMENTS[number];
 
 export interface FeePart {
-  mode : 'PERCENT' | 'FIXED';
-  value: number;  // bps se PERCENT, cents se FIXED
+  bps?  : number;  // % em basis points (1% = 100)
+  cents?: number;  // R$ em centavos (R$ 1,00 = 100)
 }
 
-export const EMPTY_PART: FeePart = { mode: 'PERCENT', value: 0 };
+export const EMPTY_PART: FeePart = {};
 
 export function isFilled(p?: FeePart | null): boolean {
-  return !!p && p.value > 0;
+  if (!p) return false;
+  return (typeof p.bps === 'number' && p.bps > 0) || (typeof p.cents === 'number' && p.cents > 0);
 }
 
 export function normalizePart(p?: any): FeePart {
-  if (!p || typeof p !== 'object') return EMPTY_PART;
-  const mode = p.mode === 'FIXED' ? 'FIXED' : 'PERCENT';
-  const value = typeof p.value === 'number' && p.value >= 0 ? Math.floor(p.value) : 0;
-  return { mode, value };
+  if (!p || typeof p !== 'object') return {};
+  const out: FeePart = {};
+  if (typeof p.bps   === 'number' && p.bps   > 0) out.bps   = Math.floor(p.bps);
+  if (typeof p.cents === 'number' && p.cents > 0) out.cents = Math.floor(p.cents);
+  return out;
 }
 
-/** Quanto uma FeePart representa em centavos sobre uma venda. */
+/** Soma % aplicada + R$ fixo → total em centavos sobre uma venda. */
 export function partToCents(p: FeePart, saleCents: number): number {
-  if (p.mode === 'PERCENT') return Math.round(saleCents * p.value / 10000);
-  return p.value;
+  const pct = p.bps   ? Math.round(saleCents * p.bps / 10000) : 0;
+  const fix = p.cents ?? 0;
+  return pct + fix;
 }
 
 // ── Config da plataforma ──

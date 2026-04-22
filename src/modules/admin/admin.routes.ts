@@ -151,17 +151,17 @@ export async function adminRoutes(app: FastifyInstance) {
   ] as const;
 
   const feePartSchema = z.object({
-    mode : z.enum(['PERCENT', 'FIXED']),
-    value: z.number().int().min(0),
+    bps  : z.number().int().min(0).optional(),
+    cents: z.number().int().min(0).optional(),
   });
 
-  const EMPTY_PART = { mode: 'PERCENT' as const, value: 0 };
+  const EMPTY_PART = {};
 
   // GET /admin/platform-fee — taxa PIX do usuário logado (compat legado)
   app.get('/platform-fee', { preHandler: [authenticate] }, async (req, reply) => {
     const { resolvePlatformFee } = await import('../../shared/services/fees.service');
     const pix = await resolvePlatformFee(req.user.sub, 'PIX');
-    const bps = pix.part.mode === 'PERCENT' ? pix.part.value : 0;
+    const bps = pix.part.bps ?? 0;
     return reply.send({
       platformBps: bps,
       platformPct: bps / 100,
@@ -169,23 +169,29 @@ export async function adminRoutes(app: FastifyInstance) {
     });
   });
 
-  // GET /admin/fees — taxa geral (plataforma 4 + adquirente 15)
+  // GET /admin/fees — taxa geral (plataforma 4 + adquirente 17)
   app.get('/fees', { preHandler: [authenticate, requireRole('ADMIN')] }, async (_req, reply) => {
     const rows = await prisma.platformConfig.findMany({
       where: { key: { startsWith: 'fees.' } },
     });
     const byKey = new Map<string, any>(rows.map(r => [r.key, r.value]));
 
+    const normalize = (raw: any) => {
+      if (!raw || typeof raw !== 'object') return {};
+      const out: any = {};
+      if (typeof raw.bps   === 'number' && raw.bps   > 0) out.bps   = raw.bps;
+      if (typeof raw.cents === 'number' && raw.cents > 0) out.cents = raw.cents;
+      return out;
+    };
+
     const platform: Record<string, any> = {};
     for (const m of PLATFORM_METHODS_LOCAL) {
-      const raw = byKey.get(`fees.platform.${m}`);
-      platform[m] = raw && typeof raw.mode === 'string' ? raw : EMPTY_PART;
+      platform[m] = normalize(byKey.get(`fees.platform.${m}`));
     }
 
     const acquirer: Record<string, any> = {};
     for (const m of ACQUIRER_METHODS_LOCAL) {
-      const raw = byKey.get(`fees.acquirer.${m}`);
-      acquirer[m] = raw && typeof raw.mode === 'string' ? raw : EMPTY_PART;
+      acquirer[m] = normalize(byKey.get(`fees.acquirer.${m}`));
     }
 
     return reply.send({ platform, acquirer });
