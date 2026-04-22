@@ -77,10 +77,38 @@ export async function integrationsRoutes(app: FastifyInstance) {
       xmlUrl  : z.string().url().optional(),
     }).parse(req.body ?? {});
 
+    // Normaliza status (NFe.io usa PascalCase: Issued, IssuedWithErrors, WaitingReturn, etc.)
+    const s = (body.status || '').toLowerCase();
     const mappedStatus =
-      body.status === 'Issued' || body.status === 'issued'        ? 'issued'
-    : body.status === 'IssuedWithErrors' || body.status === 'failed' ? 'failed'
-    :                                                                  'processing';
+      s === 'issued'                                         ? 'issued'
+    : s === 'issuedwitherrors' || s === 'failed' || s === 'cancelled' ? 'failed'
+    :                                                          'processing';
+
+    // Se não veio pdfUrl e veio id, tenta buscar direto na API do NFe.io
+    // usando as credenciais do produtor dono do pedido.
+    let pdfUrl = body.pdfUrl;
+    if (!pdfUrl && body.id && mappedStatus === 'issued') {
+      try {
+        const offer = await prisma.offer.findUnique({
+          where  : { id: order.offerId },
+          include: { product: { include: { producer: { select: { userId: true } } } } },
+        });
+        const producerUserId = offer?.product?.producer?.userId;
+        if (producerUserId) {
+          const integration = await prisma.userIntegration.findUnique({
+            where: { userId_provider: { userId: producerUserId, provider: 'NFE_IO' } },
+          });
+          if (integration?.config) {
+            const { buildNFeIo } = await import('../../shared/services/nfeio.service');
+            const nfe = buildNFeIo(integration.config);
+            if (nfe) {
+              const result = await nfe.consultar(body.id);
+              pdfUrl = result.pdfUrl;
+            }
+          }
+        }
+      } catch { /* segue sem pdfUrl — vai aparecer só o número */ }
+    }
 
     await prisma.order.update({
       where: { id: order.id },
@@ -91,14 +119,14 @@ export async function integrationsRoutes(app: FastifyInstance) {
             id    : body.id,
             number: body.number ? String(body.number) : undefined,
             status: mappedStatus,
-            pdfUrl: body.pdfUrl,
+            pdfUrl,
             xmlUrl: body.xmlUrl,
           },
         },
       },
     });
 
-    return reply.send({ ok: true, orderId: order.id, status: mappedStatus });
+    return reply.send({ ok: true, orderId: order.id, status: mappedStatus, pdfUrl });
   });
 
   // GET /integrations — lista integrações do usuário logado
