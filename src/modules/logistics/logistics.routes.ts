@@ -79,7 +79,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
 
   // ── GET /logistics/quote-order/:orderId — cotação baseada num pedido ──
   app.get('/quote-order/:orderId', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')],
   }, async (req, reply) => {
     const { orderId } = req.params as { orderId: string };
     const order = await prisma.order.findUnique({
@@ -119,7 +119,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
   // ── POST /logistics/ship — criar envio no Melhor Envio (auto ou manual) ──
   // Body { orderId, serviceId? } — se não vier serviceId, usa o mais barato disponível
   app.post('/ship', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')],
   }, async (req, reply) => {
     const body = z.object({
       orderId  : z.string(),
@@ -138,8 +138,9 @@ export async function logisticsRoutes(app: FastifyInstance) {
     const producerUserId = order.offer.product.producer?.userId;
     if (!producerUserId) throw new AppError('Produtor sem cadastro válido', 500);
 
-    // Permissão
-    if ((req.user as any).role === 'PRODUCER' && producerUserId !== (req.user as any).sub) {
+    // Permissão — produtor/afiliado só despacha os próprios pedidos
+    const role = (req.user as any).role;
+    if ((role === 'PRODUCER' || role === 'AFFILIATE') && producerUserId !== (req.user as any).sub) {
       throw new ForbiddenError();
     }
 
@@ -305,7 +306,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
 
   // ── GET /logistics/orders — pedidos físicos do produtor/admin ──
   app.get('/orders', {
-    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')],
   }, async (req, reply) => {
     const { page = '1', limit = '20', status } = req.query as any;
     const skip = (Number(page) - 1) * Number(limit);
@@ -313,7 +314,8 @@ export async function logisticsRoutes(app: FastifyInstance) {
     const where: any = { offer: { product: { type: 'PHYSICAL' } } };
     if (status) where.status = status;
 
-    if ((req.user as any).role === 'PRODUCER') {
+    if ((req.user as any).role === 'PRODUCER' || (req.user as any).role === 'AFFILIATE') {
+      // Afiliado co-produtor também tem um Producer record
       const producer = await prisma.producer.findUnique({ where: { userId: (req.user as any).sub } });
       if (!producer) return reply.send({ data: [], total: 0 });
       where.offer.product.producerId = producer.id;
