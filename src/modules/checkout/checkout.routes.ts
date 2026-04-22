@@ -170,6 +170,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
     try {
       const result = await gateway.processPayment({
         offerId       : offer.id,
+        orderId       : order.id,             // ID do Order — vira Order.code no Pagar.me
         amountCents   : offer.priceCents,
         method        : body.method as any,
         installments  : body.installments,

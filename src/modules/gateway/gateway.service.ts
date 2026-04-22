@@ -10,6 +10,7 @@ import { CieloAdapter } from './acquirers/cielo/cielo.adapter';
 
 export interface PaymentInput {
   offerId: string;
+  orderId?: string;        // ID do Order no nosso banco — vira code no Pagar.me
   amountCents: number;
   method: PaymentMethod;
   installments?: number;
