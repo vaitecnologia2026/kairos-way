@@ -77,16 +77,53 @@ export async function logisticsRoutes(app: FastifyInstance) {
     }
   });
 
-  // ── POST /logistics/ship — criar envio no Melhor Envio ──
+  // ── GET /logistics/quote-order/:orderId — cotação baseada num pedido ──
+  app.get('/quote-order/:orderId', {
+    preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
+  }, async (req, reply) => {
+    const { orderId } = req.params as { orderId: string };
+    const order = await prisma.order.findUnique({
+      where  : { id: orderId },
+      include: { offer: { include: { product: { include: { producer: true } } } } },
+    });
+    if (!order) throw new NotFoundError('Pedido');
+
+    const producerUserId = order.offer.product.producer?.userId;
+    if (!producerUserId) throw new AppError('Produtor sem cadastro válido', 500);
+
+    const svc = await getProducerMelhorEnvio(producerUserId);
+    if (!svc) throw new AppError('Produtor não configurou Melhor Envio', 503);
+
+    const billing = (order.metadata as any)?.billingAddress || {};
+    if (!billing.zipCode) throw new AppError('Pedido sem endereço de destino', 422);
+
+    const product = order.offer.product;
+    const weightKg = Math.max(0.1, (product.weightGrams || 500) / 1000);
+
+    try {
+      const quotes = await svc.quote({
+        fromCep   : (svc as any).cfg?.fromCep || process.env.DEFAULT_FROM_CEP || '01310100',
+        toCep     : billing.zipCode,
+        weightKg,
+        valueCents: order.amountCents,
+        heightCm  : (product as any).heightCm || 10,
+        widthCm   : (product as any).widthCm  || 15,
+        lengthCm  : (product as any).lengthCm || 20,
+      });
+      return reply.send(quotes);
+    } catch (err: any) {
+      return reply.status(502).send({ message: 'Falha ao cotar', error: err.message });
+    }
+  });
+
+  // ── POST /logistics/ship — criar envio no Melhor Envio (auto ou manual) ──
+  // Body { orderId, serviceId? } — se não vier serviceId, usa o mais barato disponível
   app.post('/ship', {
     preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')],
   }, async (req, reply) => {
     const body = z.object({
-      orderId    : z.string(),
-      serviceId  : z.number(),   // id da modalidade retornada por /quote
-      fromAddress: z.record(z.any()),
-      toAddress  : z.record(z.any()),
-      volumes    : z.array(z.record(z.any())).min(1),
+      orderId  : z.string(),
+      serviceId: z.number().optional(),
     }).parse(req.body);
 
     const order = await prisma.order.findUnique({
@@ -96,6 +133,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
 
     if (!order) throw new NotFoundError('Pedido');
     if (order.offer.product.type !== 'PHYSICAL') throw new AppError('Produto não é físico', 422);
+    if (order.status !== 'APPROVED') throw new AppError('Pedido não aprovado', 422);
 
     const producerUserId = order.offer.product.producer?.userId;
     if (!producerUserId) throw new AppError('Produtor sem cadastro válido', 500);
@@ -108,12 +146,96 @@ export async function logisticsRoutes(app: FastifyInstance) {
     const svc = await getProducerMelhorEnvio(producerUserId);
     if (!svc) throw new AppError('Produtor não configurou Melhor Envio (seção Integrações)', 503);
 
+    // Monta endereços e volume automaticamente
+    const billing = (order.metadata as any)?.billingAddress || {};
+    if (!billing.zipCode || !billing.street) {
+      throw new AppError('Pedido sem endereço completo — não é possível despachar', 422);
+    }
+
+    // Busca dados do produtor para montar endereço de origem
+    const producer = await prisma.producer.findFirst({
+      where  : { userId: producerUserId },
+      include: { user: true },
+    });
+    const producerMeta = (producer?.metadata as any) || {};
+    const producerAddr = producerMeta.address || {};
+    const meCfg        = (svc as any).cfg || {};
+
+    const product  = order.offer.product;
+    const weightKg = Math.max(0.1, (product.weightGrams || 500) / 1000);
+
+    // Se não vier serviceId, faz cotação e pega o mais barato
+    let serviceId = body.serviceId;
+    if (!serviceId) {
+      const quotes = await svc.quote({
+        fromCep   : meCfg.fromCep || producerAddr.zipCode || process.env.DEFAULT_FROM_CEP || '01310100',
+        toCep     : billing.zipCode,
+        weightKg,
+        valueCents: order.amountCents,
+      });
+      const valid = quotes.filter(q => !q.error && q.priceCents > 0);
+      if (valid.length === 0) throw new AppError('Nenhum serviço de entrega disponível para este CEP', 422);
+      const cheapest = valid.sort((a, b) => a.priceCents - b.priceCents)[0];
+      serviceId = cheapest.id;
+      logger.info({ orderId: order.id, serviceId, priceCents: cheapest.priceCents, name: cheapest.name },
+        'Logistics: serviço auto-selecionado (mais barato)');
+    }
+
     const payload = {
-      service : body.serviceId,
-      from    : body.fromAddress,
-      to      : body.toAddress,
-      volumes : body.volumes,
-      options : { insurance_value: order.amountCents / 100, receipt: false, own_hand: false },
+      service: serviceId,
+      from: {
+        name         : producer?.user?.name || producer?.companyName || 'Remetente',
+        phone        : producerMeta.phone   || '11999999999',
+        email        : producer?.user?.email || '',
+        document     : (producer?.user as any)?.document || '',
+        company_document: '',
+        state_register: '',
+        address      : producerAddr.street       || producerMeta.street       || 'Rua Não Informada',
+        number       : producerAddr.number       || producerMeta.number       || 'S/N',
+        complement   : producerAddr.complement   || '',
+        district     : producerAddr.neighborhood || producerMeta.neighborhood || 'Centro',
+        city         : producerAddr.city         || producerMeta.city         || 'São Paulo',
+        state_abbr   : (producerAddr.state || producerMeta.state || 'SP').toUpperCase().slice(0, 2),
+        country_id   : 'BR',
+        postal_code  : (meCfg.fromCep || producerAddr.zipCode || '01310100').replace(/\D/g, ''),
+        note         : '',
+      },
+      to: {
+        name         : order.customerName || 'Cliente',
+        phone        : order.customerPhone || '11999999999',
+        email        : order.customerEmail || '',
+        document     : (order.customerDoc || '').replace(/\D/g, ''),
+        company_document: '',
+        state_register: '',
+        address      : billing.street,
+        number       : billing.number       || 'S/N',
+        complement   : billing.complement   || '',
+        district     : billing.neighborhood || '',
+        city         : billing.city,
+        state_abbr   : (billing.state || '').toUpperCase().slice(0, 2),
+        country_id   : 'BR',
+        postal_code  : billing.zipCode.replace(/\D/g, ''),
+        note         : '',
+      },
+      products: [{
+        name    : product.name,
+        quantity: 1,
+        unitary_value: order.amountCents / 100,
+      }],
+      volumes: [{
+        height: (product as any).heightCm || 10,
+        width : (product as any).widthCm  || 15,
+        length: (product as any).lengthCm || 20,
+        weight: weightKg,
+      }],
+      options: {
+        insurance_value: order.amountCents / 100,
+        receipt        : false,
+        own_hand       : false,
+        reverse        : false,
+        non_commercial : false,
+        invoice        : { key: '' },
+      },
     };
 
     const result = await svc.createShipment(payload);
@@ -123,7 +245,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
       create: {
         orderId     : order.id,
         carrier     : 'MELHOR_ENVIO',
-        service     : String(body.serviceId),
+        service     : String(serviceId),
         trackingCode: result.id,
         status      : 'DISPATCHED',
         shippedAt   : new Date(),
@@ -131,6 +253,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
       },
       update: {
         carrier     : 'MELHOR_ENVIO',
+        service     : String(serviceId),
         trackingCode: result.id,
         status      : 'DISPATCHED',
         shippedAt   : new Date(),
@@ -142,10 +265,11 @@ export async function logisticsRoutes(app: FastifyInstance) {
       userId  : (req.user as any).sub,
       action  : 'MELHOR_ENVIO_SHIP_CREATED',
       resource: `order:${order.id}`,
-      details : { shipmentMeId: result.id },
+      details : { shipmentMeId: result.id, serviceId },
       level   : 'MEDIUM',
     });
 
+    logger.info({ orderId: order.id, shipmentMeId: result.id }, 'Logistics: envio criado no Melhor Envio');
     return reply.status(201).send({ shipment, melhorEnvio: result });
   });
 
