@@ -183,45 +183,79 @@ export async function logisticsRoutes(app: FastifyInstance) {
         'Logistics: serviço auto-selecionado (mais barato)');
     }
 
+    // Normaliza CPF/CNPJ (11 ou 14 dígitos — senão omite)
+    const normalizeDoc = (raw?: string | null): string | undefined => {
+      const d = (raw || '').replace(/\D/g, '');
+      return (d.length === 11 || d.length === 14) ? d : undefined;
+    };
+    // Normaliza telefone (10 ou 11 dígitos — senão omite)
+    const normalizePhone = (raw?: string | null): string | undefined => {
+      const d = (raw || '').replace(/\D/g, '');
+      return (d.length >= 10 && d.length <= 13) ? d : undefined;
+    };
+    // Normaliza CEP (8 dígitos — senão null)
+    const normalizeCep = (raw?: string | null): string | undefined => {
+      const d = (raw || '').replace(/\D/g, '');
+      return d.length === 8 ? d : undefined;
+    };
+    // Remove campos undefined/'' do objeto (ME rejeita strings vazias em alguns campos)
+    const pruneEmpty = (obj: Record<string, any>) => {
+      const out: Record<string, any> = {};
+      for (const [k, v] of Object.entries(obj)) {
+        if (v === undefined || v === null || v === '') continue;
+        out[k] = v;
+      }
+      return out;
+    };
+
+    const producerDoc   = normalizeDoc((producer?.user as any)?.document);
+    const producerPhone = normalizePhone(producerMeta.phone || (producer?.user as any)?.phone);
+    const producerCep   = normalizeCep(meCfg.fromCep || producerAddr.zipCode || producerMeta.zipCode);
+    const customerDoc   = normalizeDoc(order.customerDoc);
+    const customerPhone = normalizePhone(order.customerPhone);
+    const customerCep   = normalizeCep(billing.zipCode);
+
+    // Valida mínimo exigido pelo Melhor Envio
+    if (!producerCep) throw new AppError('Produtor sem CEP de origem — preencha em Perfil ou reconecte Melhor Envio', 422);
+    if (!customerCep) throw new AppError('Pedido sem CEP válido — cliente precisa ter preenchido endereço no checkout', 422);
+    if (!producerDoc)   logger.warn({ userId: producerUserId }, 'Logistics: produtor sem document (CPF/CNPJ) — ME pode rejeitar');
+    if (!customerDoc)   logger.warn({ orderId: order.id },   'Logistics: cliente sem document (CPF/CNPJ) — ME pode rejeitar');
+
     const payload = {
       service: serviceId,
-      from: {
-        name         : producer?.user?.name || producer?.companyName || 'Remetente',
-        phone        : producerMeta.phone   || '11999999999',
-        email        : producer?.user?.email || '',
-        document     : (producer?.user as any)?.document || '',
-        company_document: '',
-        state_register: '',
-        address      : producerAddr.street       || producerMeta.street       || 'Rua Não Informada',
-        number       : producerAddr.number       || producerMeta.number       || 'S/N',
-        complement   : producerAddr.complement   || '',
-        district     : producerAddr.neighborhood || producerMeta.neighborhood || 'Centro',
-        city         : producerAddr.city         || producerMeta.city         || 'São Paulo',
-        state_abbr   : (producerAddr.state || producerMeta.state || 'SP').toUpperCase().slice(0, 2),
-        country_id   : 'BR',
-        postal_code  : (meCfg.fromCep || producerAddr.zipCode || '01310100').replace(/\D/g, ''),
-        note         : '',
-      },
-      to: {
-        name         : order.customerName || 'Cliente',
-        phone        : order.customerPhone || '11999999999',
-        email        : order.customerEmail || '',
-        document     : (order.customerDoc || '').replace(/\D/g, ''),
-        company_document: '',
-        state_register: '',
-        address      : billing.street,
-        number       : billing.number       || 'S/N',
-        complement   : billing.complement   || '',
-        district     : billing.neighborhood || '',
-        city         : billing.city,
-        state_abbr   : (billing.state || '').toUpperCase().slice(0, 2),
-        country_id   : 'BR',
-        postal_code  : billing.zipCode.replace(/\D/g, ''),
-        note         : '',
-      },
+      from: pruneEmpty({
+        name            : producer?.user?.name || producer?.companyName || 'Remetente',
+        phone           : producerPhone,
+        email           : producer?.user?.email,
+        document        : producerDoc && producerDoc.length === 11 ? producerDoc : undefined,
+        company_document: producerDoc && producerDoc.length === 14 ? producerDoc : undefined,
+        address         : producerAddr.street       || producerMeta.street,
+        number          : producerAddr.number       || producerMeta.number       || 'S/N',
+        complement      : producerAddr.complement   || producerMeta.complement,
+        district        : producerAddr.neighborhood || producerMeta.neighborhood || 'Centro',
+        city            : producerAddr.city         || producerMeta.city         || 'São Paulo',
+        state_abbr      : (producerAddr.state || producerMeta.state || 'SP').toUpperCase().slice(0, 2),
+        country_id      : 'BR',
+        postal_code     : producerCep,
+      }),
+      to: pruneEmpty({
+        name            : order.customerName || 'Cliente',
+        phone           : customerPhone,
+        email           : order.customerEmail,
+        document        : customerDoc && customerDoc.length === 11 ? customerDoc : undefined,
+        company_document: customerDoc && customerDoc.length === 14 ? customerDoc : undefined,
+        address         : billing.street,
+        number          : billing.number       || 'S/N',
+        complement      : billing.complement,
+        district        : billing.neighborhood || 'Centro',
+        city            : billing.city,
+        state_abbr      : (billing.state || '').toUpperCase().slice(0, 2),
+        country_id      : 'BR',
+        postal_code     : customerCep,
+      }),
       products: [{
-        name    : product.name,
-        quantity: 1,
+        name         : product.name,
+        quantity     : 1,
         unitary_value: order.amountCents / 100,
       }],
       volumes: [{
@@ -236,9 +270,17 @@ export async function logisticsRoutes(app: FastifyInstance) {
         own_hand       : false,
         reverse        : false,
         non_commercial : false,
-        invoice        : { key: '' },
       },
     };
+
+    logger.info({
+      orderId    : order.id,
+      serviceId,
+      producerCep,
+      customerCep,
+      hasProducerDoc: !!producerDoc,
+      hasCustomerDoc: !!customerDoc,
+    }, 'Logistics: enviando payload ao Melhor Envio');
 
     let result: any;
     try {
