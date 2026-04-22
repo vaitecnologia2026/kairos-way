@@ -180,15 +180,17 @@ export async function logisticsRoutes(app: FastifyInstance) {
     // Se não vier serviceId, faz cotação e pega o mais barato
     let serviceId = body.serviceId;
     if (!serviceId) {
-      // Prioriza CEP do produtor (perfil), só usa meCfg/DEFAULT como último recurso
-      const fromCep = String(producerAddr.zipCode || meCfg.fromCep || process.env.DEFAULT_FROM_CEP || '01310100')
-        .replace(/\D/g, '');
+      // CEP do produtor é OBRIGATÓRIO — sem default mascarado
+      const producerZip = String(producerAddr.zipCode || meCfg.fromCep || '').replace(/\D/g, '');
+      if (producerZip.length !== 8) {
+        throw new AppError(
+          'Endereço do produtor não está preenchido no Perfil. Vá em "Meu Perfil" → seção "Endereço" e preencha CEP, rua, número, bairro, cidade e UF antes de despachar.',
+          422,
+        );
+      }
+      const fromCep = producerZip;
       const toCep = String(billing.zipCode || '').replace(/\D/g, '');
 
-      // Valida CEPs ANTES de chamar ME (calculate exige 8 dígitos)
-      if (fromCep.length !== 8) {
-        throw new AppError(`CEP de origem inválido (${fromCep || 'vazio'}) — preencha o endereço do produtor no Perfil.`, 422);
-      }
       if (toCep.length !== 8) {
         throw new AppError(`CEP de destino inválido (${toCep || 'vazio'}) — pedido sem endereço do cliente.`, 422);
       }
