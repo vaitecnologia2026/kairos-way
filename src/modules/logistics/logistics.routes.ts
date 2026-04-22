@@ -181,23 +181,60 @@ export async function logisticsRoutes(app: FastifyInstance) {
     let serviceId = body.serviceId;
     if (!serviceId) {
       // Prioriza CEP do produtor (perfil), só usa meCfg/DEFAULT como último recurso
-      const fromCep = (producerAddr.zipCode || meCfg.fromCep || process.env.DEFAULT_FROM_CEP || '01310100')
+      const fromCep = String(producerAddr.zipCode || meCfg.fromCep || process.env.DEFAULT_FROM_CEP || '01310100')
         .replace(/\D/g, '');
-      const toCep = (billing.zipCode || '').replace(/\D/g, '');
-      const quotes = await svc.quote({
-        fromCep,
-        toCep,
-        weightKg,
-        valueCents: order.amountCents,
-        heightCm  : (product as any).heightCm || 10,
-        widthCm   : (product as any).widthCm  || 15,
-        lengthCm  : (product as any).lengthCm || 20,
-      });
+      const toCep = String(billing.zipCode || '').replace(/\D/g, '');
+
+      // Valida CEPs ANTES de chamar ME (calculate exige 8 dígitos)
+      if (fromCep.length !== 8) {
+        throw new AppError(`CEP de origem inválido (${fromCep || 'vazio'}) — preencha o endereço do produtor no Perfil.`, 422);
+      }
+      if (toCep.length !== 8) {
+        throw new AppError(`CEP de destino inválido (${toCep || 'vazio'}) — pedido sem endereço do cliente.`, 422);
+      }
+
+      let quotes: any[] = [];
+      try {
+        quotes = await svc.quote({
+          fromCep,
+          toCep,
+          weightKg,
+          valueCents: order.amountCents,
+          heightCm  : (product as any).heightCm || 10,
+          widthCm   : (product as any).widthCm  || 15,
+          lengthCm  : (product as any).lengthCm || 20,
+        });
+      } catch (err: any) {
+        const me = err?.response?.data;
+        logger.error({
+          orderId: order.id,
+          status : err?.response?.status,
+          fromCep, toCep, weightKg,
+          meData : JSON.stringify(me),
+        }, 'Logistics: Melhor Envio rejeitou a cotação');
+
+        const buildErrorList = (errs: any): string => {
+          if (!errs || typeof errs !== 'object') return '';
+          return Object.entries(errs)
+            .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : String(v)}`)
+            .join(' | ');
+        };
+        const detailed = buildErrorList(me?.errors);
+        const friendly = detailed || me?.message || err.message || 'Falha ao cotar frete';
+
+        return reply.status(422).send({
+          statusCode: 422,
+          error     : 'MelhorEnvioError',
+          message   : `Cotação rejeitada: ${friendly}`,
+          meResponse: me,
+          debug     : { fromCep, toCep, weightKg },
+        });
+      }
+
       logger.info({ orderId: order.id, fromCep, toCep, quoteCount: quotes.length, quotes },
         'Logistics: cotação bruta do Melhor Envio');
       const valid = quotes.filter(q => !q.error && q.priceCents > 0);
       if (valid.length === 0) {
-        // Se houver quotes com erros, mostra todos os motivos (CEP fora de área, formato inválido etc)
         const errs = quotes
           .filter(q => q.error)
           .map(q => `${q.name || q.company}: ${q.error}`)
