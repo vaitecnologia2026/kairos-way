@@ -17,6 +17,26 @@ const auditService = new AuditService();
 
 export async function checkoutRoutes(app: FastifyInstance) {
 
+  // ── GET /checkout/order-status/:orderId — status do pedido (público, para polling) ──
+  app.get('/order-status/:orderId', async (req, reply) => {
+    const { orderId } = req.params as { orderId: string };
+    const order = await prisma.order.findUnique({
+      where : { id: orderId },
+      select: {
+        id           : true,
+        status       : true,
+        paymentMethod: true,
+        amountCents  : true,
+        pixCode      : true,
+        pixQrCode    : true,
+        boletoUrl    : true,
+        boletoBarcode: true,
+      },
+    });
+    if (!order) return reply.status(404).send({ message: 'Pedido não encontrado' });
+    return reply.send(order);
+  });
+
   // ── GET /checkout/:slug — dados da oferta ─────────────────────
   app.get('/:slug', async (req, reply) => {
     const { slug } = req.params as { slug: string };

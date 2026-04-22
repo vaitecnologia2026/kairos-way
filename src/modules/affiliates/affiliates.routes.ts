@@ -51,6 +51,10 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     });
     logger.info({ userId: user.id, affiliateId: affiliate.id, email: body.email }, 'Afiliado: cadastro realizado — aguardando aprovação');
 
+    // Notifica admins
+    const { notifyAffiliatePending } = await import('../../shared/utils/notify');
+    await notifyAffiliatePending(body.name);
+
     return reply.status(201).send({
       message: 'Cadastro realizado! Aguarde a aprovação do produtor para acessar a plataforma.',
     });
@@ -167,6 +171,9 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     });
     logger.info({ affiliateId: id, email: affiliate.user.email, approvedBy: req.user.sub }, 'Afiliado: aprovado');
 
+    const { notifyAffiliateApproved } = await import('../../shared/utils/notify');
+    await notifyAffiliateApproved({ affiliateUserId: affiliate.userId });
+
     return reply.send({ message: 'Afiliado aprovado com sucesso!' });
   });
 
@@ -174,6 +181,8 @@ export async function affiliatesRoutes(app: FastifyInstance) {
   app.post('/:id/reject', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'STAFF')] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const { reason } = z.object({ reason: z.string().optional() }).parse(req.body);
+
+    const affiliate = await prisma.affiliate.findUnique({ where: { id }, select: { userId: true } });
 
     await prisma.affiliate.update({
       where: { id },
@@ -191,15 +200,29 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     });
     logger.info({ affiliateId: id, reason, rejectedBy: req.user.sub }, 'Afiliado: rejeitado');
 
+    if (affiliate?.userId) {
+      const { notifyAffiliateRejected } = await import('../../shared/utils/notify');
+      await notifyAffiliateRejected({ affiliateUserId: affiliate.userId, reason });
+    }
+
     return reply.send({ message: 'Afiliado rejeitado.' });
   });
 
   // ─── ROTAS DO AFILIADO ────────────────────────────────────────────────────
 
   // GET /affiliates/marketplace — ofertas disponíveis para afiliar
+  // Só retorna ofertas com: affiliateConfig habilitado + splits configurados
+  // (evita mostrar link que não pode efetivar venda)
   app.get('/marketplace', { preHandler: [authenticate] }, async (req, reply) => {
     const configs = await prisma.affiliateConfig.findMany({
-      where  : { enabled: true },
+      where  : {
+        enabled: true,
+        offer  : {
+          isActive  : true,
+          deletedAt : null,
+          splitRules: { some: { isActive: true } },  // só ofertas com splits configurados
+        },
+      },
       include: {
         offer: {
           include: {
@@ -240,6 +263,14 @@ export async function affiliatesRoutes(app: FastifyInstance) {
 
     const config = await prisma.affiliateConfig.findUnique({ where: { offerId, enabled: true } });
     if (!config) return reply.status(404).send({ message: 'Oferta não disponível para afiliação' });
+
+    // Valida que a oferta tem splits ativos — sem isso o checkout falha
+    const splitCount = await prisma.splitRule.count({ where: { offerId, isActive: true } });
+    if (splitCount === 0) {
+      return reply.status(422).send({
+        message: 'Oferta ainda não tem splits configurados. Aguarde o produtor completar a configuração antes de se afiliar.',
+      });
+    }
 
     // Criar perfil de afiliado se não existir
     let affiliate = await prisma.affiliate.findUnique({ where: { userId: req.user.sub } });
