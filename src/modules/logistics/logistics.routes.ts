@@ -97,12 +97,20 @@ export async function logisticsRoutes(app: FastifyInstance) {
     const billing = (order.metadata as any)?.billingAddress || {};
     if (!billing.zipCode) throw new AppError('Pedido sem endereço de destino', 422);
 
+    // CEP de origem: producer.metadata.address.zipCode tem prioridade, fallback meCfg.fromCep
+    const producer = await prisma.producer.findFirst({ where: { userId: producerUserId } });
+    const producerAddr = ((producer?.metadata as any) || {}).address || {};
+    const meCfg = (svc as any).cfg || {};
+    const fromCep = (producerAddr.zipCode || meCfg.fromCep || process.env.DEFAULT_FROM_CEP || '01310100')
+      .replace(/\D/g, '');
+    if (fromCep.length !== 8) throw new AppError('CEP de origem inválido — preencha endereço no Perfil', 422);
+
     const product = order.offer.product;
     const weightKg = Math.max(0.1, (product.weightGrams || 500) / 1000);
 
     try {
       const quotes = await svc.quote({
-        fromCep   : (svc as any).cfg?.fromCep || process.env.DEFAULT_FROM_CEP || '01310100',
+        fromCep,
         toCep     : billing.zipCode,
         weightKg,
         valueCents: order.amountCents,
@@ -110,8 +118,11 @@ export async function logisticsRoutes(app: FastifyInstance) {
         widthCm   : (product as any).widthCm  || 15,
         lengthCm  : (product as any).lengthCm || 20,
       });
+      logger.info({ orderId, fromCep, toCep: billing.zipCode, count: quotes.length, quotes },
+        'Logistics: cotação retornada pelo Melhor Envio');
       return reply.send(quotes);
     } catch (err: any) {
+      logger.error({ err: err?.response?.data || err.message }, 'Logistics: falha cotação');
       return reply.status(502).send({ message: 'Falha ao cotar', error: err.message });
     }
   });
@@ -169,14 +180,33 @@ export async function logisticsRoutes(app: FastifyInstance) {
     // Se não vier serviceId, faz cotação e pega o mais barato
     let serviceId = body.serviceId;
     if (!serviceId) {
+      // Prioriza CEP do produtor (perfil), só usa meCfg/DEFAULT como último recurso
+      const fromCep = (producerAddr.zipCode || meCfg.fromCep || process.env.DEFAULT_FROM_CEP || '01310100')
+        .replace(/\D/g, '');
+      const toCep = (billing.zipCode || '').replace(/\D/g, '');
       const quotes = await svc.quote({
-        fromCep   : meCfg.fromCep || producerAddr.zipCode || process.env.DEFAULT_FROM_CEP || '01310100',
-        toCep     : billing.zipCode,
+        fromCep,
+        toCep,
         weightKg,
         valueCents: order.amountCents,
+        heightCm  : (product as any).heightCm || 10,
+        widthCm   : (product as any).widthCm  || 15,
+        lengthCm  : (product as any).lengthCm || 20,
       });
+      logger.info({ orderId: order.id, fromCep, toCep, quoteCount: quotes.length, quotes },
+        'Logistics: cotação bruta do Melhor Envio');
       const valid = quotes.filter(q => !q.error && q.priceCents > 0);
-      if (valid.length === 0) throw new AppError('Nenhum serviço de entrega disponível para este CEP', 422);
+      if (valid.length === 0) {
+        // Se houver quotes com erros, mostra todos os motivos (CEP fora de área, formato inválido etc)
+        const errs = quotes
+          .filter(q => q.error)
+          .map(q => `${q.name || q.company}: ${q.error}`)
+          .join(' | ');
+        const msg = errs
+          ? `Transportadoras recusaram este envio — ${errs}`
+          : `Nenhum serviço de entrega disponível. CEP origem=${fromCep}, destino=${toCep}. Verifique se sua conta Melhor Envio está verificada (CPF/CNPJ + endereço).`;
+        throw new AppError(msg, 422);
+      }
       const cheapest = valid.sort((a, b) => a.priceCents - b.priceCents)[0];
       serviceId = cheapest.id;
       logger.info({ orderId: order.id, serviceId, priceCents: cheapest.priceCents, name: cheapest.name },
@@ -210,7 +240,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
 
     const producerDoc   = normalizeDoc((producer?.user as any)?.document);
     const producerPhone = normalizePhone(producerMeta.phone || (producer?.user as any)?.phone);
-    const producerCep   = normalizeCep(meCfg.fromCep || producerAddr.zipCode || producerMeta.zipCode);
+    const producerCep   = normalizeCep(producerAddr.zipCode || producerMeta.zipCode || meCfg.fromCep);
     const customerDoc   = normalizeDoc(order.customerDoc);
     const customerPhone = normalizePhone(order.customerPhone);
     const customerCep   = normalizeCep(billing.zipCode);
