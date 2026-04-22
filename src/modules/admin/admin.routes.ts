@@ -232,11 +232,12 @@ export async function adminRoutes(app: FastifyInstance) {
     return reply.send({ message: 'Taxas atualizadas' });
   });
 
-  // GET /admin/fees/users — usuários com taxa personalizada + busca
+  // GET /admin/fees/users — usuários com taxa personalizada + busca + filtro por role
   app.get('/fees/users', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
-    const { q = '', onlyCustom } = req.query as { q?: string; onlyCustom?: string };
+    const { q = '', onlyCustom, role } = req.query as { q?: string; onlyCustom?: string; role?: string };
     const search = q.trim();
     const onlyCustomFlag = onlyCustom === '1' || onlyCustom === 'true';
+    const roleFilter = role === 'PRODUCER' || role === 'AFFILIATE' ? role : null;
 
     const userFilter = search
       ? { OR: [
@@ -245,21 +246,28 @@ export async function adminRoutes(app: FastifyInstance) {
         ]}
       : {};
 
+    const wantProducers  = roleFilter === null || roleFilter === 'PRODUCER';
+    const wantAffiliates = roleFilter === null || roleFilter === 'AFFILIATE';
+
     const [producers, affiliates] = await Promise.all([
-      prisma.producer.findMany({
-        where  : onlyCustomFlag
-          ? { customFeeBps: { not: null }, user: userFilter }
-          : { user: userFilter },
-        include: { user: { select: { id: true, name: true, email: true } } },
-        take   : 50,
-      }),
-      prisma.affiliate.findMany({
-        where  : onlyCustomFlag
-          ? { customFeeBps: { not: null }, user: userFilter }
-          : { user: userFilter },
-        include: { user: { select: { id: true, name: true, email: true } } },
-        take   : 50,
-      }),
+      wantProducers
+        ? prisma.producer.findMany({
+            where  : onlyCustomFlag
+              ? { customFeeBps: { not: null }, user: userFilter }
+              : { user: userFilter },
+            include: { user: { select: { id: true, name: true, email: true } } },
+            take   : 50,
+          })
+        : Promise.resolve([]),
+      wantAffiliates
+        ? prisma.affiliate.findMany({
+            where  : onlyCustomFlag
+              ? { customFeeBps: { not: null }, user: userFilter }
+              : { user: userFilter },
+            include: { user: { select: { id: true, name: true, email: true } } },
+            take   : 50,
+          })
+        : Promise.resolve([]),
     ]);
 
     const rows = [
