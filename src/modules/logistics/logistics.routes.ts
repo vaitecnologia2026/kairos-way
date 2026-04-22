@@ -290,17 +290,32 @@ export async function logisticsRoutes(app: FastifyInstance) {
       logger.error({
         orderId: order.id,
         status : err?.response?.status,
-        data   : me,
-        payload,
+        meData : JSON.stringify(me),          // stringificado para garantir que aparece no Railway
+        payload: JSON.stringify(payload),
       }, 'Logistics: Melhor Envio rejeitou o createShipment');
-      // Extrai mensagem legível do ME
-      const friendly = me?.message
-        || (me?.errors && typeof me.errors === 'object'
-              ? Object.entries(me.errors).map(([k, v]) => `${k}: ${(Array.isArray(v) ? v.join(', ') : v)}`).join(' | ')
-              : null)
+
+      // Extrai erros detalhados. Se ME retornar { errors: {field: [reasons]} },
+      // junta tudo: "field: reason1, reason2 | field2: reason3"
+      const buildErrorList = (errs: any): string => {
+        if (!errs || typeof errs !== 'object') return '';
+        return Object.entries(errs)
+          .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : String(v)}`)
+          .join(' | ');
+      };
+
+      const detailed = buildErrorList(me?.errors);
+      const friendly = detailed
+        || me?.message
         || err.message
         || 'Falha ao criar envio no Melhor Envio';
-      throw new AppError(friendly, 422);
+
+      // Retorna também o response bruto do ME para ajudar debug no front
+      return reply.status(422).send({
+        statusCode: 422,
+        error     : 'MelhorEnvioError',
+        message   : friendly,
+        meResponse: me,   // para ver exatamente o que o ME mandou
+      });
     }
 
     if (!result?.id) {
