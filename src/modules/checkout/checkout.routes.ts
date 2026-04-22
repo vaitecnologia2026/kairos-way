@@ -179,6 +179,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
         customerPhone : body.customerPhone,   // FIX: obrigatório para PIX
         cardToken     : body.cardToken,
         billingAddress: body.billingAddress,  // FIX: obrigatório para Boleto
+        productName   : offer.product.name,   // description para Pluga/NFe.io
         ip            : req.ip,
       });
 

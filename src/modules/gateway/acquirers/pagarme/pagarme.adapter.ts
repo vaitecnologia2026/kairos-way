@@ -61,12 +61,15 @@ export class PagarmeAdapter implements IAcquirerAdapter {
     input   : PaymentInput,
     customer: Record<string, any>
   ): Promise<PaymentResult> {
+    const code = input.offerId.slice(-8).toUpperCase();
+    const desc = input.productName || `Pedido ${code}`;
     const payload = {
+      code,
       items: [{
         amount     : input.amountCents,
-        description: `Pedido ${input.offerId.slice(-8).toUpperCase()}`,
+        description: desc,
         quantity   : 1,
-        code       : input.offerId.slice(-8),
+        code,
       }],
       customer,
       payments: [{
@@ -75,7 +78,11 @@ export class PagarmeAdapter implements IAcquirerAdapter {
           expires_in: 900, // 15 minutos — PCI RN-014
         },
       }],
-      metadata: { offerId: input.offerId, ip: input.ip },
+      metadata: {
+        offerId    : input.offerId,
+        ip         : input.ip,
+        description: desc,
+      },
     };
 
     try {
@@ -187,12 +194,16 @@ export class PagarmeAdapter implements IAcquirerAdapter {
     const dueDate = new Date();
     dueDate.setDate(dueDate.getDate() + 3);
 
+    const code = input.offerId.slice(-8).toUpperCase();
+    const desc = input.productName || `Pedido ${code}`;
+
     const payload = {
+      code,
       items: [{
         amount     : input.amountCents,
-        description: `Pedido ${input.offerId.slice(-8).toUpperCase()}`,
+        description: desc,
         quantity   : 1,
-        code       : input.offerId.slice(-8),
+        code,
       }],
       customer,
       payments: [{

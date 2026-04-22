@@ -16,8 +16,10 @@ export interface PaymentInput {
   customerEmail: string;
   customerName: string;
   customerDoc?: string;
+  customerPhone?: string;
   cardToken?: string;
   billingAddress?: Record<string, string>;
+  productName?: string;   // nome do produto — usado em itens e descrição
   ip?: string;
 }
 
