@@ -335,6 +335,21 @@ export class PagarmeAdapter implements IAcquirerAdapter {
       };
     }
 
+    // Endereço do cliente — obrigatório para emissão de NFe (consumido pelo
+    // Pluga depois e enviado ao NFe.io). billingAddress vem do checkout.
+    const addr = input.billingAddress as Record<string, any> | undefined;
+    if (addr && (addr.zipCode || addr.street)) {
+      customer.address = {
+        country    : addr.country || 'BR',
+        state      : (addr.state  || '').toUpperCase(),
+        city       : addr.city   || '',
+        zip_code   : (addr.zipCode || '').replace(/\D/g, ''),
+        line_1     : [addr.number, addr.street, addr.neighborhood]
+                       .filter(Boolean).join(', '),
+        line_2     : addr.complement || '',
+      };
+    }
+
     return customer;
   }
 
