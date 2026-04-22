@@ -1,11 +1,45 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import axios from 'axios';
 import { authenticate } from '../../shared/middleware/auth.middleware';
 import { prisma } from '../../shared/utils/prisma';
 import { logger } from '../../shared/utils/logger';
 import { AuditService } from '../audit/audit.service';
 import { buildMelhorEnvio } from '../../shared/services/melhor-envio.service';
 import { buildNFeIo }       from '../../shared/services/nfeio.service';
+
+// ══════════════════════════════════════════════════════════════════
+// MELHOR ENVIO — OAuth 2.0
+// ══════════════════════════════════════════════════════════════════
+// Fluxo:
+//   1. GET /integrations/melhor-envio/authorize (autenticado)
+//      → redireciona para ME com ?state=<userId>
+//   2. Produtor autoriza no ME
+//   3. ME redireciona para /integrations/melhor-envio/callback?code&state
+//      → troca code por access_token e salva em UserIntegration
+//
+// Envs necessárias:
+//   MELHOR_ENVIO_CLIENT_ID
+//   MELHOR_ENVIO_CLIENT_SECRET
+//   MELHOR_ENVIO_REDIRECT_URI   (ex: https://.../integrations/melhor-envio/callback)
+//   MELHOR_ENVIO_SANDBOX=true|false
+//   FRONTEND_URL                (para redirecionar o usuário de volta)
+
+const ME_SCOPES = [
+  'cart-read', 'cart-write',
+  'shipping-calculate', 'shipping-cancel', 'shipping-checkout',
+  'shipping-companies', 'shipping-generate', 'shipping-preview',
+  'shipping-print', 'shipping-share', 'shipping-tracking',
+  'ecommerce-shipping',
+  'orders-read', 'purchases-read',
+  'companies-read', 'users-read',
+].join(' ');
+
+function meBaseUrl(): string {
+  return process.env.MELHOR_ENVIO_SANDBOX === 'true'
+    ? 'https://sandbox.melhorenvio.com.br'
+    : 'https://melhorenvio.com.br';
+}
 
 const audit = new AuditService();
 
@@ -41,6 +75,101 @@ function maskConfig(provider: Provider, config: any): any {
 }
 
 export async function integrationsRoutes(app: FastifyInstance) {
+
+  // ── GET /integrations/melhor-envio/authorize ── (retorna a URL do OAuth)
+  // O frontend chama via axios (com JWT) e depois faz window.location = url
+  app.get('/melhor-envio/authorize', { preHandler: [authenticate] }, async (req, reply) => {
+    const clientId    = process.env.MELHOR_ENVIO_CLIENT_ID;
+    const redirectUri = process.env.MELHOR_ENVIO_REDIRECT_URI;
+    if (!clientId || !redirectUri) {
+      return reply.status(500).send({ message: 'OAuth Melhor Envio não configurado (env)' });
+    }
+    const state = req.user.sub;
+    const url = `${meBaseUrl()}/oauth/authorize`
+      + `?client_id=${encodeURIComponent(clientId)}`
+      + `&redirect_uri=${encodeURIComponent(redirectUri)}`
+      + `&response_type=code`
+      + `&scope=${encodeURIComponent(ME_SCOPES)}`
+      + `&state=${encodeURIComponent(state)}`;
+    return reply.send({ url });
+  });
+
+  // ── GET /integrations/melhor-envio/callback ── (recebe code do ME)
+  app.get('/melhor-envio/callback', async (req, reply) => {
+    const { code, state, error } = req.query as { code?: string; state?: string; error?: string };
+    const frontUrl = process.env.FRONTEND_URL || 'https://kairos-front-sage.vercel.app';
+
+    if (error || !code || !state) {
+      return reply.redirect(`${frontUrl}/produtor/integracoes?me=error&reason=${encodeURIComponent(error || 'missing_params')}`, 302);
+    }
+
+    const clientId     = process.env.MELHOR_ENVIO_CLIENT_ID;
+    const clientSecret = process.env.MELHOR_ENVIO_CLIENT_SECRET;
+    const redirectUri  = process.env.MELHOR_ENVIO_REDIRECT_URI;
+
+    if (!clientId || !clientSecret || !redirectUri) {
+      return reply.redirect(`${frontUrl}/produtor/integracoes?me=error&reason=env_missing`, 302);
+    }
+
+    try {
+      const { data } = await axios.post(`${meBaseUrl()}/oauth/token`, {
+        grant_type   : 'authorization_code',
+        client_id    : clientId,
+        client_secret: clientSecret,
+        redirect_uri : redirectUri,
+        code,
+      }, { timeout: 15_000 });
+
+      const { access_token, refresh_token, expires_in, token_type } = data;
+      if (!access_token) {
+        logger.error({ data }, 'MelhorEnvio OAuth: resposta sem access_token');
+        return reply.redirect(`${frontUrl}/produtor/integracoes?me=error&reason=no_token`, 302);
+      }
+
+      const expiresAt = expires_in
+        ? new Date(Date.now() + Number(expires_in) * 1000).toISOString()
+        : null;
+
+      await prisma.userIntegration.upsert({
+        where : { userId_provider: { userId: state, provider: 'MELHOR_ENVIO' } },
+        create: {
+          userId  : state,
+          provider: 'MELHOR_ENVIO',
+          config  : {
+            accessToken : access_token,
+            refreshToken: refresh_token,
+            tokenType   : token_type,
+            expiresAt,
+            sandbox     : process.env.MELHOR_ENVIO_SANDBOX === 'true',
+          } as any,
+          isActive: true,
+        },
+        update: {
+          config: {
+            accessToken : access_token,
+            refreshToken: refresh_token,
+            tokenType   : token_type,
+            expiresAt,
+            sandbox     : process.env.MELHOR_ENVIO_SANDBOX === 'true',
+          } as any,
+          isActive: true,
+        },
+      });
+
+      await audit.log({
+        userId : state,
+        action : 'MELHOR_ENVIO_CONNECTED',
+        details: { tokenType: token_type, expiresIn: expires_in },
+        level  : 'MEDIUM',
+      });
+
+      logger.info({ userId: state }, 'MelhorEnvio: OAuth concluído com sucesso');
+      return reply.redirect(`${frontUrl}/produtor/integracoes?me=ok`, 302);
+    } catch (err: any) {
+      logger.error({ err: err?.response?.data || err.message }, 'MelhorEnvio OAuth: falha ao trocar code');
+      return reply.redirect(`${frontUrl}/produtor/integracoes?me=error&reason=token_exchange_failed`, 302);
+    }
+  });
 
   // ── POST /integrations/nfe-callback — recebe resultado da NFe.io (via Pluga)
   // Público (sem auth). Use um segredo em query (?key=XYZ) para validar.
