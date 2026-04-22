@@ -79,15 +79,19 @@ export async function integrationsRoutes(app: FastifyInstance) {
 
     // Normaliza status (NFe.io usa PascalCase: Issued, IssuedWithErrors, WaitingReturn, etc.)
     const s = (body.status || '').toLowerCase();
-    const mappedStatus =
-      s === 'issued'                                         ? 'issued'
+    let mappedStatus =
+      s === 'issued'                                                  ? 'issued'
     : s === 'issuedwitherrors' || s === 'failed' || s === 'cancelled' ? 'failed'
-    :                                                          'processing';
+    :                                                                   'processing';
 
-    // Se não veio pdfUrl e veio id, tenta buscar direto na API do NFe.io
-    // usando as credenciais do produtor dono do pedido.
     let pdfUrl = body.pdfUrl;
-    if (!pdfUrl && body.id && mappedStatus === 'issued') {
+    let nfeId  = body.id;
+    let nfeNum = body.number ? String(body.number) : undefined;
+
+    // Se veio vazio (Pluga não consegue expor vars do NFe.io), busca tudo na API
+    // do NFe.io usando as credenciais do produtor dono do pedido.
+    const needsLookup = (!nfeId && !pdfUrl) || (nfeId && !pdfUrl && mappedStatus === 'issued');
+    if (needsLookup) {
       try {
         const offer = await prisma.offer.findUnique({
           where  : { id: order.offerId },
@@ -102,12 +106,30 @@ export async function integrationsRoutes(app: FastifyInstance) {
             const { buildNFeIo } = await import('../../shared/services/nfeio.service');
             const nfe = buildNFeIo(integration.config);
             if (nfe) {
-              const result = await nfe.consultar(body.id);
-              pdfUrl = result.pdfUrl;
+              if (nfeId) {
+                // Só busca o PDF pelo ID conhecido
+                const result = await nfe.consultar(nfeId);
+                pdfUrl       = result.pdfUrl;
+                nfeNum       = nfeNum ?? result.nfeNumber;
+                mappedStatus = result.status;
+              } else {
+                // Fallback total: lista últimas notas e acha a que tem o order.code
+                const recent = await nfe.listarRecentes?.();
+                const match  = recent?.find((n: any) =>
+                  (n.description || '').includes(code) ||
+                  (n.borrower?.email || '').toLowerCase() === (order.customerEmail || '').toLowerCase(),
+                );
+                if (match) {
+                  nfeId        = match.id;
+                  nfeNum       = match.number;
+                  pdfUrl       = match.pdfUrl;
+                  mappedStatus = match.status;
+                }
+              }
             }
           }
         }
-      } catch { /* segue sem pdfUrl — vai aparecer só o número */ }
+      } catch { /* não bloqueia o callback — salva o que tem */ }
     }
 
     await prisma.order.update({
@@ -116,8 +138,8 @@ export async function integrationsRoutes(app: FastifyInstance) {
         metadata: {
           ...(order.metadata as object || {}),
           nfe: {
-            id    : body.id,
-            number: body.number ? String(body.number) : undefined,
+            id    : nfeId,
+            number: nfeNum,
             status: mappedStatus,
             pdfUrl,
             xmlUrl: body.xmlUrl,

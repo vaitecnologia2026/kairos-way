@@ -169,6 +169,39 @@ export class NFeIoService {
   }
 
   /**
+   * Lista as N últimas NFS-e emitidas (ordenadas da mais recente para a mais antiga).
+   * Útil para o callback de integração conseguir achar a nota pelo código do pedido
+   * quando o Pluga não expõe as variáveis do passo anterior.
+   */
+  async listarRecentes(limit = 20): Promise<Array<{
+    id: string; number: string; status: 'issued' | 'processing' | 'failed';
+    pdfUrl?: string; xmlUrl?: string; description?: string;
+    borrower?: { email?: string; name?: string };
+  }>> {
+    try {
+      const { data } = await this.api.get(
+        `/companies/${this.companyId}/serviceinvoices`,
+        { params: { pageCount: limit, pageIndex: 0 } }
+      );
+      const items = data.serviceInvoices || data.invoices || data || [];
+      return (Array.isArray(items) ? items : []).map((inv: any) => ({
+        id         : inv.id,
+        number     : String(inv.number || inv.invoiceNumber || ''),
+        status     : inv.flowStatus === 'Issued' ? 'issued'
+                   : inv.flowStatus === 'IssuedWithErrors' ? 'failed'
+                   : 'processing',
+        pdfUrl     : inv.links?.find((l: any) => l.rel === 'pdf')?.href,
+        xmlUrl     : inv.links?.find((l: any) => l.rel === 'xml')?.href,
+        description: inv.description,
+        borrower   : inv.borrower,
+      }));
+    } catch (err: any) {
+      logger.warn({ err: err?.response?.data || err.message }, 'NFe.io: listarRecentes falhou');
+      return [];
+    }
+  }
+
+  /**
    * Cancelar uma NF-e
    */
   async cancelar(nfeId: string): Promise<void> {
