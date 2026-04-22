@@ -121,6 +121,7 @@ export async function logisticsRoutes(app: FastifyInstance) {
   app.post('/ship', {
     preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')],
   }, async (req, reply) => {
+    try {
     const body = z.object({
       orderId  : z.string(),
       serviceId: z.number().optional(),
@@ -296,6 +297,29 @@ export async function logisticsRoutes(app: FastifyInstance) {
 
     logger.info({ orderId: order.id, shipmentMeId: result.id }, 'Logistics: envio criado no Melhor Envio');
     return reply.status(201).send({ shipment, melhorEnvio: result });
+    } catch (err: any) {
+      // Captura tudo — AppError/NotFoundError já tem status próprio, deixa passar
+      if (err?.statusCode && typeof err.statusCode === 'number') throw err;
+      // Erros não esperados: loga stack completo e retorna mensagem útil
+      logger.error({
+        orderId : (req.body as any)?.orderId,
+        err     : err?.message,
+        name    : err?.name,
+        stack   : err?.stack?.split('\n').slice(0, 5).join(' | '),
+        meResp  : err?.response?.data,
+      }, 'Logistics /ship: exceção não tratada');
+
+      const meMsg = err?.response?.data?.message
+        || (err?.response?.data?.errors && JSON.stringify(err.response.data.errors))
+        || err?.message
+        || 'Erro desconhecido';
+      return reply.status(500).send({
+        statusCode: 500,
+        error     : 'ShipError',
+        message   : `Falha ao despachar: ${meMsg}`,
+        hint      : 'Verifique se o produtor preencheu endereço no perfil, se o Melhor Envio está ativo e se o pedido tem endereço do cliente.',
+      });
+    }
   });
 
   // ── GET /logistics/tracking/:orderId — tracking do envio ──
