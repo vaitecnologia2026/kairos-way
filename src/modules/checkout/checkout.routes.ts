@@ -161,6 +161,8 @@ export async function checkoutRoutes(app: FastifyInstance) {
         ipAddress    : req.ip,
         userAgent    : req.headers['user-agent'],
         appliedFees  : appliedFees as any,
+        // Endereço do cliente — usado depois na emissão da NF-e pelo NFe.io
+        metadata     : body.billingAddress ? { billingAddress: body.billingAddress } as any : undefined,
       },
     });
     logger.info({ orderId: order.id, offerId: offer.id, method: body.method, amountCents: offer.priceCents }, 'Checkout: pedido criado');

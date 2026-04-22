@@ -9,7 +9,7 @@ import { buildNFeIo }       from '../../shared/services/nfeio.service';
 
 const audit = new AuditService();
 
-const PROVIDERS = ['MELHOR_ENVIO', 'NFE_IO'] as const;
+const PROVIDERS = ['MELHOR_ENVIO', 'NFE_IO', 'PLUGA'] as const;
 type Provider = typeof PROVIDERS[number];
 
 // Schemas de config por provider (validação)
@@ -25,6 +25,10 @@ const CONFIG_SCHEMAS: Record<Provider, z.ZodTypeAny> = {
     companyId       : z.string().min(1, 'Company ID obrigatório'),
     cityServiceCode : z.string().optional(),
   }),
+  PLUGA: z.object({
+    webhookUrl : z.string().url('URL inválida').optional(),
+    apiKey     : z.string().optional(),
+  }),
 };
 
 /** Remove campos sensíveis antes de retornar ao frontend. */
@@ -35,6 +39,9 @@ function maskConfig(provider: Provider, config: any): any {
     return { ...config, accessToken: config.accessToken ? mask(config.accessToken) : '' };
   }
   if (provider === 'NFE_IO') {
+    return { ...config, apiKey: config.apiKey ? mask(config.apiKey) : '' };
+  }
+  if (provider === 'PLUGA') {
     return { ...config, apiKey: config.apiKey ? mask(config.apiKey) : '' };
   }
   return config;

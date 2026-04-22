@@ -417,14 +417,20 @@ function startNfeWorker(): Worker {
   const worker = new Worker('nfe', async (job) => {
     const { orderId } = job.data;
 
-    if (!process.env.NFEIO_API_KEY || !process.env.NFEIO_COMPANY_ID) {
-      logger.warn({ orderId }, 'NFEIO não configurado — NF-e não emitida');
-      return;
-    }
-
     const order = await prisma.order.findUnique({
       where  : { id: orderId },
-      include: { offer: { include: { product: { select: { name: true, type: true } } } } },
+      include: {
+        offer: {
+          include: {
+            product: {
+              select: {
+                name: true, type: true,
+                producer: { select: { userId: true } },
+              },
+            },
+          },
+        },
+      },
     });
 
     if (!order) return;
@@ -434,14 +440,52 @@ function startNfeWorker(): Worker {
       return;
     }
 
+    // Busca credenciais NFe.io do PRODUTOR (não global)
+    const producerUserId = order.offer.product.producer?.userId;
+    let nfeInstance: NFeIoService | null = null;
+
+    if (producerUserId) {
+      const integration = await prisma.userIntegration.findUnique({
+        where: { userId_provider: { userId: producerUserId, provider: 'NFE_IO' } },
+      });
+      if (integration?.isActive && integration.config) {
+        const { buildNFeIo } = await import('../services/nfeio.service');
+        nfeInstance = buildNFeIo(integration.config);
+      }
+    }
+
+    // Fallback para credenciais globais (env) se produtor não configurou
+    if (!nfeInstance) {
+      if (!process.env.NFEIO_API_KEY || !process.env.NFEIO_COMPANY_ID) {
+        logger.warn({ orderId, producerUserId }, 'NFE_IO: produtor sem integração e sem fallback — NF-e não emitida');
+        return;
+      }
+      nfeInstance = nfeIo;
+    }
+
+    // Monta endereço do order.metadata.billingAddress (salvo no checkout)
+    const billing = (order.metadata as any)?.billingAddress || {};
+    const customerAddress = {
+      street      : billing.street,
+      number      : billing.number,
+      complement  : billing.complement,
+      neighborhood: billing.neighborhood,
+      city        : billing.city,
+      state       : billing.state,
+      zipCode     : billing.zipCode,
+      country     : 'BRA',
+    };
+
     try {
-      const result = await nfeIo.emitir({
-        orderId      : order.id,
-        customerName : order.customerName || 'Cliente',
-        customerEmail: order.customerEmail || '',
-        customerDoc  : order.customerDoc   || undefined,
-        productName  : order.offer.product.name,
-        amountCents  : order.amountCents,
+      const result = await nfeInstance.emitir({
+        orderId        : order.id,
+        customerName   : order.customerName || 'Cliente',
+        customerEmail  : order.customerEmail || '',
+        customerDoc    : order.customerDoc   || undefined,
+        customerPhone  : order.customerPhone || undefined,
+        customerAddress,
+        productName    : order.offer.product.name,
+        amountCents    : order.amountCents,
       });
 
       await prisma.order.update({
