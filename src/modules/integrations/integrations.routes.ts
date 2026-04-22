@@ -280,6 +280,146 @@ export async function integrationsRoutes(app: FastifyInstance) {
     return reply.send({ ok: true, orderId: order.id, status: mappedStatus, pdfUrl });
   });
 
+  // ── POST /integrations/nfe-sync/:orderId — força sync de uma NFe travada ──
+  // Consulta NFe.io e atualiza Order.metadata.nfe. Útil quando o callback do
+  // Pluga não disparou e a nota ficou em "processing" eterno no Kairos.
+  app.post('/nfe-sync/:orderId', { preHandler: [authenticate] }, async (req, reply) => {
+    const { orderId } = req.params as { orderId: string };
+    const order = await prisma.order.findUnique({
+      where  : { id: orderId },
+      include: { offer: { include: { product: { include: { producer: { select: { userId: true } } } } } } },
+    });
+    if (!order) return reply.status(404).send({ message: 'Pedido não encontrado' });
+
+    const producerUserId = order.offer?.product?.producer?.userId;
+    const role = (req.user as any).role;
+    if (role !== 'ADMIN' && producerUserId !== (req.user as any).sub) {
+      return reply.status(403).send({ message: 'Sem permissão para este pedido' });
+    }
+
+    if (!producerUserId) return reply.status(422).send({ message: 'Produtor inválido' });
+    const integration = await prisma.userIntegration.findUnique({
+      where: { userId_provider: { userId: producerUserId, provider: 'NFE_IO' } },
+    });
+    if (!integration) return reply.status(422).send({ message: 'Produtor sem NFe.io configurada' });
+
+    const nfe = buildNFeIo(integration.config);
+    if (!nfe) return reply.status(422).send({ message: 'Credenciais NFe.io incompletas' });
+
+    const currentNfe = (order.metadata as any)?.nfe || {};
+    const code = order.id.slice(-8).toUpperCase();
+
+    let result: any = null;
+    try {
+      if (currentNfe.id) {
+        // Consulta direta pelo ID conhecido
+        result = await nfe.consultar(currentNfe.id);
+      } else {
+        // Fallback: lista últimas N notas e acha a que corresponde ao pedido
+        const recent = await nfe.listarRecentes(50);
+        const match = recent.find((n: any) =>
+          (n.description || '').includes(code) ||
+          (n.borrower?.email || '').toLowerCase() === (order.customerEmail || '').toLowerCase(),
+        );
+        if (match) {
+          result = {
+            nfeId    : match.id,
+            nfeNumber: match.number,
+            status   : match.status,
+            pdfUrl   : match.pdfUrl,
+            xmlUrl   : match.xmlUrl,
+          };
+        }
+      }
+    } catch (err: any) {
+      logger.error({ err: err?.response?.data || err.message, orderId }, 'NFe sync falhou');
+      return reply.status(502).send({ message: 'Falha ao consultar NFe.io', error: err?.message });
+    }
+
+    if (!result) {
+      return reply.status(404).send({ message: 'Nenhuma NFe encontrada na NFe.io para este pedido' });
+    }
+
+    const updatedNfe = {
+      id    : result.nfeId || result.id || currentNfe.id,
+      number: result.nfeNumber || result.number || currentNfe.number,
+      status: result.status || currentNfe.status,
+      pdfUrl: result.pdfUrl || currentNfe.pdfUrl,
+      xmlUrl: result.xmlUrl || currentNfe.xmlUrl,
+    };
+
+    await prisma.order.update({
+      where: { id: order.id },
+      data : {
+        metadata: { ...(order.metadata as object || {}), nfe: updatedNfe },
+      },
+    });
+
+    logger.info({ orderId, status: updatedNfe.status, hasPdf: !!updatedNfe.pdfUrl }, 'NFe sincronizada');
+    return reply.send({ ok: true, orderId: order.id, nfe: updatedNfe });
+  });
+
+  // ── POST /integrations/nfe-sync-all — sincroniza TODAS as NFes em processing do produtor
+  app.post('/nfe-sync-all', { preHandler: [authenticate] }, async (req, reply) => {
+    const userId = (req.user as any).sub;
+    const role   = (req.user as any).role;
+
+    const integration = await prisma.userIntegration.findUnique({
+      where: { userId_provider: { userId, provider: 'NFE_IO' } },
+    });
+    if (!integration) return reply.status(422).send({ message: 'NFe.io não configurada' });
+    const nfe = buildNFeIo(integration.config);
+    if (!nfe) return reply.status(422).send({ message: 'Credenciais incompletas' });
+
+    // Busca pedidos do produtor com nfe em processing ou sem nfe
+    const producer = await prisma.producer.findUnique({ where: { userId } });
+    if (!producer && role !== 'ADMIN') return reply.status(404).send({ message: 'Produtor não encontrado' });
+
+    const where: any = { status: 'APPROVED' };
+    if (producer) where.offer = { product: { producerId: producer.id } };
+
+    const orders = await prisma.order.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    });
+
+    const toSync = orders.filter(o => {
+      const n = (o.metadata as any)?.nfe;
+      return !n || n.status === 'processing' || !n.pdfUrl;
+    });
+
+    const recent = await nfe.listarRecentes(100);
+    let synced = 0;
+    for (const order of toSync) {
+      const code = order.id.slice(-8).toUpperCase();
+      const match = recent.find((n: any) =>
+        (n.description || '').includes(code) ||
+        (n.borrower?.email || '').toLowerCase() === (order.customerEmail || '').toLowerCase(),
+      );
+      if (!match) continue;
+      await prisma.order.update({
+        where: { id: order.id },
+        data : {
+          metadata: {
+            ...(order.metadata as object || {}),
+            nfe: {
+              id    : match.id,
+              number: match.number,
+              status: match.status,
+              pdfUrl: match.pdfUrl,
+              xmlUrl: match.xmlUrl,
+            },
+          },
+        },
+      });
+      synced++;
+    }
+
+    logger.info({ userId, checked: toSync.length, synced }, 'NFe batch sync');
+    return reply.send({ checked: toSync.length, synced });
+  });
+
   // GET /integrations — lista integrações do usuário logado
   app.get('/', { preHandler: [authenticate] }, async (req, reply) => {
     const rows = await prisma.userIntegration.findMany({
