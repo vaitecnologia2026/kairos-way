@@ -114,12 +114,12 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
       throw new AppError('O CPF/CNPJ informado no aceite não confere com o cadastrado no perfil.', 422);
     }
 
-    const expectedPhrase = `EU ${user.name} PORTADOR DO CPF ${userDoc} ACEITO OS TERMOS`;
+    const expectedPhrase = `EU, ${user.name}, PORTADOR DO CPF ${userDoc}, ACEITO OS TERMOS DA KAIROS GATEWAY DE PAGAMENTOS PARA RANKING & CONQUISTAS.`;
     const normalizedTyped = normalizeAcceptance(body.acceptanceText);
     const normalizedExpected = normalizeAcceptance(expectedPhrase);
-    if (!normalizedTyped.includes(normalizedExpected)) {
+    if (normalizedTyped !== normalizedExpected) {
       throw new AppError(
-        `A frase de aceite não confere. Digite exatamente: "EU, ${user.name}, PORTADOR DO CPF ${userDoc}, ACEITO OS TERMOS"`,
+        `A frase de aceite não confere. Digite exatamente: "${expectedPhrase}"`,
         422,
       );
     }
