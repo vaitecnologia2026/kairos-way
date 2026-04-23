@@ -133,10 +133,30 @@ export async function affiliatesRoutes(app: FastifyInstance) {
   });
 
   // GET /affiliates/pending — afiliados (filtra por status)
+  // PRODUCER: só enxerga afiliados inscritos em ofertas dos seus produtos
+  // ADMIN/STAFF: lista geral
   app.get('/pending', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'STAFF')] }, async (req, reply) => {
     const { status } = req.query as { status?: string };
+    const role = (req.user as any).role as string;
+
+    let affiliateIdsFilter: string[] | null = null;
+    if (role === 'PRODUCER') {
+      const producer = await prisma.producer.findUnique({ where: { userId: (req.user as any).sub } });
+      if (!producer) return reply.send([]);
+      const enrollments = await prisma.affiliateEnrollment.findMany({
+        where : { offer: { product: { producerId: producer.id } } },
+        select: { affiliateId: true },
+        distinct: ['affiliateId'],
+      });
+      affiliateIdsFilter = enrollments.map(e => e.affiliateId);
+      if (affiliateIdsFilter.length === 0) return reply.send([]);
+    }
+
     const affiliates = await prisma.affiliate.findMany({
-      where  : status ? { status } : {},
+      where  : {
+        ...(status ? { status } : {}),
+        ...(affiliateIdsFilter ? { id: { in: affiliateIdsFilter } } : {}),
+      },
       include: { user: { select: { id: true, name: true, email: true, phone: true, document: true, createdAt: true } } },
       orderBy: { createdAt: 'desc' },
     });
@@ -562,44 +582,68 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       byProducer.set(m.producerId, arr);
     }
 
-    // Para cada produtor, resolve o nome e calcula o progresso do afiliado
+    // Nome do afiliado logado (aparece no ranking)
+    const me = await prisma.user.findUnique({
+      where : { id: userId },
+      select: { name: true },
+    });
+    const myName = me?.name || 'Você';
+
+    // Para cada produtor, resolve o nome, calcula progresso E monta o ranking
+    // entre todos os afiliados que tiveram vendas APROVADAS para os produtos
+    // deste produtor. Ranking é calculado aqui no backend (fonte única da verdade).
     const result = await Promise.all(
       Array.from(byProducer.entries()).map(async ([producerUserId, milestones]) => {
-        // Resolve o Producer record para obter o nome e o id (Producer.id)
         const producer = await prisma.producer.findUnique({
           where : { userId: producerUserId },
           select: { id: true, tradeName: true, companyName: true },
         });
 
         const producerName = producer?.tradeName || producer?.companyName || 'Produtor';
-        const producerId   = producer?.id;   // Producer.id para filtrar orders
+        const producerId   = producer?.id;
 
-        const [valueSales, unitSales] = await Promise.all([
-          prisma.order.aggregate({
-            _sum : { amountCents: true },
-            where: {
-              affiliateId: affiliate.id,
-              status     : 'APPROVED',
-              ...(producerId ? { offer: { product: { producerId } } } : {}),
-            },
-          }),
-          prisma.order.count({
-            where: {
-              affiliateId: affiliate.id,
-              status     : 'APPROVED',
-              ...(producerId ? { offer: { product: { producerId } } } : {}),
-            },
-          }),
-        ]);
+        // Agrega TODOS os afiliados (não só o logado) que têm vendas aprovadas
+        // para os produtos desse produtor — base do ranking.
+        const leaderboard = producerId
+          ? await prisma.order.groupBy({
+              by   : ['affiliateId'],
+              _sum : { amountCents: true },
+              _count: { _all: true },
+              where: {
+                status     : 'APPROVED',
+                affiliateId: { not: null },
+                offer      : { product: { producerId } },
+              },
+            })
+          : [];
 
-        const totalValueCents = valueSales._sum.amountCents ?? 0;
-        const totalUnits      = unitSales;
+        // Rankings separados: por valor e por unidades (os milestones usam um dos dois)
+        const valueRanking = [...leaderboard]
+          .filter(r => r.affiliateId)
+          .sort((a, b) => (b._sum.amountCents ?? 0) - (a._sum.amountCents ?? 0))
+          .map(r => r.affiliateId as string);
+
+        const unitRanking = [...leaderboard]
+          .filter(r => r.affiliateId)
+          .sort((a, b) => (b._count._all ?? 0) - (a._count._all ?? 0))
+          .map(r => r.affiliateId as string);
+
+        // Progresso do afiliado logado (reaproveita do leaderboard se existir)
+        const myRow = leaderboard.find(r => r.affiliateId === affiliate.id);
+        const totalValueCents = myRow?._sum.amountCents ?? 0;
+        const totalUnits      = myRow?._count._all ?? 0;
 
         const milestonesWithProgress = milestones.map(m => {
           const current    = m.targetType === 'VALUE' ? totalValueCents : totalUnits;
           const percentage = Math.min(100, Math.round((current / m.targetValue) * 100));
           const reached    = current >= m.targetValue;
-          // NOVO: enriquece com dados de termos e status de inscrição
+
+          // Posição no ranking — só faz sentido se o afiliado já tem ao menos 1 venda
+          const ranking        = m.targetType === 'VALUE' ? valueRanking : unitRanking;
+          const idx            = ranking.indexOf(affiliate.id);
+          const position       = idx >= 0 ? idx + 1 : null;
+          const totalParticipants = ranking.length;
+
           return {
             ...m,
             current,
@@ -607,6 +651,9 @@ export async function affiliatesRoutes(app: FastifyInstance) {
             reached,
             isEnrolled : enrolledMap.has(m.id),
             acceptedAt : enrolledMap.get(m.id) ?? null,
+            myName,
+            position,
+            totalParticipants,
           };
         });
 
