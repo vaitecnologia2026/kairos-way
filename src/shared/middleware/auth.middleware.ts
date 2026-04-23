@@ -80,3 +80,28 @@ export function requireRole(...roles: Role[]) {
 export function authGuard(...roles: Role[]) {
   return [authenticate, requireRole(...roles)];
 }
+
+/**
+ * Garante que o produtor (role=PRODUCER) completou o KYC e tem recebedor Pagar.me.
+ * Afiliados-coprodutores também passam por aqui quando acessam ações de produtor.
+ * Usar APÓS authenticate.
+ */
+export async function requireProducerApproved(
+  request: FastifyRequest,
+  _reply: FastifyReply,
+): Promise<void> {
+  const user = request.user;
+  if (!user) throw new UnauthorizedError();
+  // ADMIN/STAFF passam direto para manutenção
+  if (user.role === 'ADMIN' || user.role === 'STAFF') return;
+
+  const producer = await prisma.producer.findUnique({ where: { userId: user.sub } });
+  if (!producer) {
+    throw new ForbiddenError('Perfil de produtor não encontrado.');
+  }
+  if (producer.kycStatus !== 'APPROVED' || !producer.isActive || !producer.pagarmeRecipientId) {
+    throw new ForbiddenError(
+      'Sua conta está em modo de leitura. Envie a documentação em "Verificação" para liberar as operações.',
+    );
+  }
+}

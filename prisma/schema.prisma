@@ -247,6 +247,10 @@ model Producer {
   rejectedAt    DateTime?
   rejectedBy    String?
   rejectedReason String?
+  pagarmeRecipientId    String?  // re_xxx — criado quando admin aprova
+  pagarmeBankAccountId  String?  // ba_xxx
+  pagarmeRecipientStatus String? // "registration" | "active" | "refused" | "affiliation"
+  pagarmeSyncedAt       DateTime?
   customFeeBps  Int?      // @deprecated — manter por compat; use customFees
   customFees    Json?     // taxas personalizadas por método: { PIX?: {bps,cents}, BOLETO?: {...}, CARD?: {...}, WITHDRAWAL?: {...} } — campo ausente/null = herda da geral
   customReleaseDays Json? // prazos personalizados: { PIX?: 1, BOLETO?: 2, CARD?: 15 } — campo ausente = herda padrão

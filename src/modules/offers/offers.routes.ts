@@ -1,7 +1,7 @@
 // ── OFFERS ROUTES ─────────────────────────────────────────────────
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { authenticate, requireRole } from '../../shared/middleware/auth.middleware';
+import { authenticate, requireRole, requireProducerApproved } from '../../shared/middleware/auth.middleware';
 import { SplitEngineService } from '../split-engine/split-engine.service';
 import { prisma } from '../../shared/utils/prisma';
 import { NotFoundError, ForbiddenError } from '../../shared/errors/AppError';
@@ -11,7 +11,7 @@ const splitEngine = new SplitEngineService();
 
 export async function offerRoutes(app: FastifyInstance) {
   // POST /offers (criar oferta para um produto)
-  app.post('/', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')] }, async (req, reply) => {
+  app.post('/', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE'), requireProducerApproved] }, async (req, reply) => {
     const body = z.object({
       productId: z.string(),
       name: z.string().min(3),
@@ -97,7 +97,7 @@ export async function offerRoutes(app: FastifyInstance) {
   });
 
   // POST /offers/:id/splits — configurar splits de uma oferta
-  app.post('/:id/splits', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')] }, async (req, reply) => {
+  app.post('/:id/splits', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE'), requireProducerApproved] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = z.object({
       splits: z.array(z.object({

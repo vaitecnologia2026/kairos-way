@@ -1,6 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { authenticate, requireRole } from '../../shared/middleware/auth.middleware';
+import { authenticate, requireRole, requireProducerApproved } from '../../shared/middleware/auth.middleware';
 import { AuditService } from '../audit/audit.service';
 import { prisma } from '../../shared/utils/prisma';
 import { NotFoundError, ForbiddenError, AppError } from '../../shared/errors/AppError';
@@ -10,7 +10,7 @@ const auditService = new AuditService();
 export async function productRoutes(app: FastifyInstance) {
 
   // POST /products
-  app.post('/', { preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')] }, async (req, reply) => {
+  app.post('/', { preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE'), requireProducerApproved] }, async (req, reply) => {
     const body = z.object({
       name: z.string().min(3),
       description: z.string().optional(),

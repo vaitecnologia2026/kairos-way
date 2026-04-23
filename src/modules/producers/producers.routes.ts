@@ -5,6 +5,7 @@ import { AuditService } from '../audit/audit.service';
 import { prisma } from '../../shared/utils/prisma';
 import { NotFoundError, AppError } from '../../shared/errors/AppError';
 import { enqueueEmail } from '../../shared/queue/enqueue';
+import { pagarmeRecipients } from '../../shared/services/pagarme-recipients.service';
 
 const auditService = new AuditService();
 
@@ -62,7 +63,144 @@ export async function producerRoutes(app: FastifyInstance) {
       include: { kycDocuments: true },
     });
     if (!producer) throw new NotFoundError('Produtor');
-    return reply.send({ kycStatus: producer.kycStatus, documents: producer.kycDocuments });
+
+    // Requisitos que destravam a aprovação
+    const bank = (producer.bankData as any) || {};
+    const reg  = (producer.metadata as any)?.registerInformation || {};
+    const hasBanking = !!(bank.bank && bank.accountNumber && bank.holderDocument);
+    const hasRegister = !!(reg.address?.zipCode && reg.phoneNumbers?.length);
+    const hasDocuments = producer.kycDocuments.length > 0;
+
+    return reply.send({
+      kycStatus            : producer.kycStatus,
+      isActive             : producer.isActive,
+      pagarmeRecipientId   : producer.pagarmeRecipientId,
+      pagarmeRecipientStatus: producer.pagarmeRecipientStatus,
+      rejectedReason       : producer.rejectedReason,
+      canOperate           : producer.kycStatus === 'APPROVED' && producer.isActive && !!producer.pagarmeRecipientId,
+      completeness         : { hasDocuments, hasBanking, hasRegister },
+      documents            : producer.kycDocuments,
+    });
+  });
+
+  // ── PATCH /producers/banking — produtor informa dados bancários ──
+  app.patch('/banking', {
+    preHandler: [authenticate, requireRole('PRODUCER')],
+  }, async (req, reply) => {
+    const body = z.object({
+      bank              : z.string().min(3).max(3), // código ISPB de 3 dígitos
+      branchNumber      : z.string().min(1).max(6),
+      branchCheckDigit  : z.string().max(2).optional(),
+      accountNumber     : z.string().min(1).max(15),
+      accountCheckDigit : z.string().min(1).max(2),
+      type              : z.enum(['checking', 'savings']),
+      holderName        : z.string().min(3),
+      holderDocument    : z.string().transform(v => v.replace(/\D/g, '')).refine(v => v.length === 11 || v.length === 14, { message: 'CPF (11) ou CNPJ (14)' }),
+    }).parse(req.body);
+
+    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+    if (!producer) throw new NotFoundError('Produtor');
+    if (producer.kycStatus === 'APPROVED') throw new AppError('Produtor já aprovado — dados bancários bloqueados', 400);
+
+    await prisma.producer.update({
+      where: { id: producer.id },
+      data : { bankData: { ...body, holderType: body.holderDocument.length === 11 ? 'individual' : 'corporation' } },
+    });
+
+    await auditService.log({ userId: req.user.sub, action: 'PRODUCER_BANK_UPDATED', level: 'MEDIUM' });
+    return reply.send({ message: 'Dados bancários salvos' });
+  });
+
+  // ── PATCH /producers/register-information — produtor completa KYC ──
+  app.patch('/register-information', {
+    preHandler: [authenticate, requireRole('PRODUCER')],
+  }, async (req, reply) => {
+    const addressSchema = z.object({
+      street        : z.string().min(2),
+      streetNumber  : z.string().min(1),
+      complementary : z.string().optional().nullable(),
+      neighborhood  : z.string().min(2),
+      city          : z.string().min(2),
+      state         : z.string().length(2).transform(v => v.toUpperCase()),
+      zipCode       : z.string().transform(v => v.replace(/\D/g, '')).refine(v => v.length === 8),
+      referencePoint: z.string().optional().nullable(),
+    });
+
+    const phoneSchema = z.object({
+      ddd    : z.string().length(2),
+      number : z.string().min(8).max(9),
+      type   : z.enum(['mobile', 'home']),
+    });
+
+    const body = z.object({
+      type         : z.enum(['individual', 'corporation']),
+      name         : z.string().min(3),
+      email        : z.string().email(),
+      document     : z.string().transform(v => v.replace(/\D/g, '')),
+      // Pessoa física
+      birthdate    : z.string().regex(/^\d{2}\/\d{2}\/\d{4}$/).optional(),
+      monthlyIncome: z.number().positive().optional(),
+      professionalOccupation: z.string().min(2).optional(),
+      motherName   : z.string().optional(),
+      // Pessoa jurídica
+      companyName  : z.string().optional(),
+      tradingName  : z.string().optional(),
+      siteUrl      : z.string().url().optional(),
+      annualRevenue: z.number().positive().optional(),
+      corporationType: z.enum(['EIRELI', 'LTDA', 'MEI', 'SA']).optional(),
+      foundingDate : z.string().regex(/^\d{2}\/\d{2}\/\d{4}$/).optional(),
+      // Comuns
+      phoneNumbers : z.array(phoneSchema).min(1).max(2),
+      address      : addressSchema,
+      mainAddress  : addressSchema.optional(),
+      managingPartners: z.array(z.any()).optional(),
+    }).parse(req.body);
+
+    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+    if (!producer) throw new NotFoundError('Produtor');
+    if (producer.kycStatus === 'APPROVED') throw new AppError('Produtor já aprovado — dados bloqueados', 400);
+
+    const currentMeta = (producer.metadata as any) || {};
+    await prisma.producer.update({
+      where: { id: producer.id },
+      data : { metadata: { ...currentMeta, registerInformation: body } },
+    });
+
+    await auditService.log({ userId: req.user.sub, action: 'PRODUCER_REGISTER_UPDATED', level: 'MEDIUM' });
+    return reply.send({ message: 'Informações cadastrais salvas' });
+  });
+
+  // ── POST /producers/kyc/submit — finaliza envio e marca DOCUMENTS_SENT ──
+  app.post('/kyc/submit', {
+    preHandler: [authenticate, requireRole('PRODUCER')],
+  }, async (req, reply) => {
+    const producer = await prisma.producer.findUnique({
+      where  : { userId: req.user.sub },
+      include: { kycDocuments: true },
+    });
+    if (!producer) throw new NotFoundError('Produtor');
+
+    const bank = (producer.bankData as any) || {};
+    const reg  = (producer.metadata as any)?.registerInformation || {};
+    const hasBanking = !!(bank.bank && bank.accountNumber && bank.holderDocument);
+    const hasRegister = !!(reg.address?.zipCode && reg.phoneNumbers?.length);
+    const hasDocuments = producer.kycDocuments.length > 0;
+
+    if (!hasBanking || !hasRegister || !hasDocuments) {
+      throw new AppError('Verificação incompleta: envie documentos, dados cadastrais e bancários antes.', 400);
+    }
+
+    if (producer.kycStatus === 'APPROVED') {
+      return reply.send({ message: 'Conta já aprovada' });
+    }
+
+    await prisma.producer.update({
+      where: { id: producer.id },
+      data : { kycStatus: 'DOCUMENTS_SENT' },
+    });
+
+    await auditService.log({ userId: req.user.sub, action: 'PRODUCER_KYC_SUBMITTED', level: 'HIGH' });
+    return reply.send({ message: 'Documentação enviada — aguardando análise do administrador' });
   });
 
   // ── GET /producers/checkout-config ───────────────────────────────
@@ -265,9 +403,106 @@ export async function producerRoutes(app: FastifyInstance) {
   }, async (req, reply) => {
     const { id } = req.params as { id: string };
 
+    const current = await prisma.producer.findUnique({
+      where  : { id },
+      include: { user: true, kycDocuments: true },
+    });
+    if (!current) throw new NotFoundError('Produtor');
+
+    // Valida pré-requisitos de KYC
+    const bank = (current.bankData as any) || {};
+    const reg  = (current.metadata as any)?.registerInformation || {};
+    if (!current.kycDocuments.length) throw new AppError('Produtor não enviou documentos', 400);
+    if (!bank.bank || !bank.accountNumber) throw new AppError('Produtor não informou dados bancários', 400);
+    if (!reg.address?.zipCode) throw new AppError('Produtor não completou o cadastro', 400);
+
+    // Cria recebedor no Pagar.me se ainda não existe
+    let pagarmeRecipientId   = current.pagarmeRecipientId;
+    let pagarmeBankAccountId = current.pagarmeBankAccountId;
+    let pagarmeRecipientStatus = current.pagarmeRecipientStatus;
+
+    if (!pagarmeRecipientId) {
+      const registerInformation: any = reg.type === 'corporation'
+        ? {
+            type              : 'corporation' as const,
+            companyName       : reg.companyName || reg.name,
+            tradingName       : reg.tradingName,
+            email             : reg.email,
+            document          : reg.document,
+            siteUrl           : reg.siteUrl,
+            annualRevenue     : reg.annualRevenue || 12000000,
+            corporationType   : reg.corporationType || 'LTDA',
+            foundingDate      : reg.foundingDate,
+            phoneNumbers      : reg.phoneNumbers,
+            address           : reg.address,
+            mainAddress       : reg.mainAddress || reg.address,
+            managingPartners  : reg.managingPartners || [],
+          }
+        : {
+            type         : 'individual' as const,
+            name         : reg.name,
+            email        : reg.email,
+            document     : reg.document,
+            birthdate    : reg.birthdate,
+            monthlyIncome: reg.monthlyIncome || 500000,
+            professionalOccupation: reg.professionalOccupation || 'Empresário',
+            motherName   : reg.motherName,
+            phoneNumbers : reg.phoneNumbers,
+            address      : reg.address,
+          };
+
+      try {
+        const recipient = await pagarmeRecipients.createRecipient({
+          name        : reg.name || current.user.name,
+          email       : reg.email || current.user.email,
+          document    : reg.document || (current.user.document || '').replace(/\D/g, ''),
+          type        : bank.holderType || (reg.type === 'corporation' ? 'corporation' : 'individual'),
+          code        : current.id,
+          defaultBankAccount: {
+            holderName        : bank.holderName,
+            holderType        : bank.holderType,
+            holderDocument    : bank.holderDocument,
+            bank              : bank.bank,
+            branchNumber      : bank.branchNumber,
+            branchCheckDigit  : bank.branchCheckDigit,
+            accountNumber     : bank.accountNumber,
+            accountCheckDigit : bank.accountCheckDigit,
+            type              : bank.type,
+          },
+          registerInformation,
+          metadata: { kairosProducerId: current.id, kairosUserId: current.userId },
+        });
+
+        pagarmeRecipientId     = recipient.id;
+        pagarmeBankAccountId   = recipient.default_bank_account?.id || null;
+        pagarmeRecipientStatus = recipient.status;
+      } catch (err: any) {
+        const details = err?.response?.data;
+        await auditService.log({
+          userId : req.user.sub,
+          action : 'PRODUCER_APPROVE_PAGARME_FAIL',
+          details: { producerId: id, pagarme: details },
+          level  : 'HIGH',
+        });
+        throw new AppError(
+          `Falha ao criar recebedor no Pagar.me: ${details?.message || err.message}`,
+          502,
+        );
+      }
+    }
+
     const producer = await prisma.producer.update({
       where  : { id },
-      data   : { kycStatus: 'APPROVED', isActive: true, approvedAt: new Date(), approvedBy: req.user.sub },
+      data   : {
+        kycStatus              : 'APPROVED',
+        isActive               : true,
+        approvedAt             : new Date(),
+        approvedBy             : req.user.sub,
+        pagarmeRecipientId,
+        pagarmeBankAccountId,
+        pagarmeRecipientStatus,
+        pagarmeSyncedAt        : new Date(),
+      },
       include: { user: true },
     });
 
@@ -279,7 +514,7 @@ export async function producerRoutes(app: FastifyInstance) {
     await auditService.log({
       userId  : req.user.sub,
       action  : 'PRODUCER_APPROVED',
-      details : { producerId: id, producerEmail: producer.user.email },
+      details : { producerId: id, producerEmail: producer.user.email, pagarmeRecipientId },
       level   : 'HIGH',
     });
 
@@ -294,7 +529,7 @@ export async function producerRoutes(app: FastifyInstance) {
       }
     );
 
-    return reply.send({ message: 'Produtor aprovado com sucesso', producer });
+    return reply.send({ message: 'Produtor aprovado e recebedor criado no Pagar.me', producer, pagarmeRecipientId });
   });
 
   // ── POST /producers/:id/reject ────────────────────────────────
