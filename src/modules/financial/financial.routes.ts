@@ -31,18 +31,32 @@ export async function financialRoutes(app: FastifyInstance) {
   });
 
   // GET /financial/splits — histórico de splits recebidos
+  // Para AFFILIATE, inclui tanto AFFILIATE (comissão) quanto PRODUCER (quando
+  // é afiliado-coprodutor e recebe da venda do próprio produto).
   app.get('/splits', { preHandler: [authenticate] }, async (req, reply) => {
     const { page = '1', limit = '50', status } = req.query as any;
     const skip = (Number(page) - 1) * Number(limit);
 
+    const recipientTypeFilter = req.user.role === 'AFFILIATE'
+      ? { in: ['AFFILIATE', 'PRODUCER'] as any[] }
+      : undefined;
+
+    const baseWhere = {
+      recipientId  : req.user.sub,
+      recipientType: recipientTypeFilter,
+      status       : status || undefined,
+    };
+
     const [data, total] = await Promise.all([
       prisma.splitRecord.findMany({
-        where: {recipientId  : req.user.sub, recipientType: req.user.role === 'AFFILIATE' ? 'AFFILIATE' : undefined, status       : status || undefined,},
+        where  : baseWhere,
         include: { order: { select: { createdAt: true, amountCents: true, customerName: true } } },
         orderBy: { createdAt: 'desc' },
         skip, take: Number(limit),
       }),
-      prisma.splitRecord.count({ where: { recipientId: req.user.sub } }),
+      prisma.splitRecord.count({
+        where: { recipientId: req.user.sub, recipientType: recipientTypeFilter },
+      }),
     ]);
     return reply.send({ data, total });
   });

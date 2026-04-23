@@ -493,8 +493,13 @@ export async function logisticsRoutes(app: FastifyInstance) {
     const { page = '1', limit = '20', status } = req.query as any;
     const skip = (Number(page) - 1) * Number(limit);
 
-    const where: any = { offer: { product: { type: 'PHYSICAL' } } };
-    if (status) where.status = status;
+    // Regra: só listam pedidos que PODEM virar envio
+    // - Pedido: status APPROVED (pago) — não mostra REJECTED/PENDING/CANCELLED
+    // - Produto: type PHYSICAL + status APPROVED (não mostra produto recusado/em análise)
+    const where: any = {
+      status: status || 'APPROVED',
+      offer : { product: { type: 'PHYSICAL', status: 'APPROVED' } },
+    };
 
     if ((req.user as any).role === 'PRODUCER' || (req.user as any).role === 'AFFILIATE') {
       // Afiliado co-produtor também tem um Producer record

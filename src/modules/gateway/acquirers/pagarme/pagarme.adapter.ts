@@ -96,7 +96,26 @@ export class PagarmeAdapter implements IAcquirerAdapter {
         throw new PaymentError('Resposta inválida do Pagar.me para PIX');
       }
 
-      const status = this.mapStatus(charge.status);
+      // Log detalhado para diagnosticar PIX indo para REJECTED indevidamente
+      logger.info({
+        chargeStatus  : charge.status,
+        txStatus      : lastTransaction.status,
+        hasQrCode     : !!lastTransaction.qr_code,
+        gatewayReason : lastTransaction.gateway_response?.errors?.[0]?.message,
+      }, 'PIX_DEBUG');
+
+      let status = this.mapStatus(charge.status);
+
+      // Regra: se o Pagar.me gerou um QR válido (qr_code presente), o pagamento
+      // pode ser concluído pelo cliente — tratamos como PENDING mesmo que o
+      // charge.status inicial reporte algo inesperado (ex: pending-before-qr).
+      if (lastTransaction.qr_code && status === 'REJECTED') {
+        logger.warn({
+          orderCode   : orderCode,
+          chargeStatus: charge.status,
+        }, 'PIX: charge marcado como REJECTED mas QR foi gerado — forçando PENDING');
+        status = 'PENDING';
+      }
 
       return {
         acquirer     : 'PAGARME',

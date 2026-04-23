@@ -234,23 +234,35 @@ export async function affiliatesRoutes(app: FastifyInstance) {
   // Só retorna ofertas com: affiliateConfig habilitado + splits configurados
   // (evita mostrar link que não pode efetivar venda)
   app.get('/marketplace', { preHandler: [authenticate] }, async (req, reply) => {
+    // Regra: só mostra ofertas VENDÁVEIS para não dar link morto
+    // - Produto APROVADO (não PENDING/REJECTED)
+    // - Oferta ativa + affiliateConfig habilitado
+    // - splitRules ativos (checamos a soma = 10000 bps depois no JS)
     const configs = await prisma.affiliateConfig.findMany({
       where  : {
         enabled: true,
         offer  : {
           isActive  : true,
           deletedAt : null,
-          splitRules: { some: { isActive: true } },  // só ofertas com splits configurados
+          splitRules: { some: { isActive: true } },
+          product   : { status: 'APPROVED', deletedAt: null },
         },
       },
       include: {
         offer: {
           include: {
-            product: { select: { name: true, imageUrl: true, type: true } },
+            product   : { select: { name: true, imageUrl: true, type: true, status: true } },
+            splitRules: { where: { isActive: true }, select: { basisPoints: true } },
           },
         },
       },
       orderBy: { createdAt: 'desc' },
+    });
+
+    // Filtro final: soma dos splits = 10000 bps
+    const valid = configs.filter(c => {
+      const total = c.offer.splitRules.reduce((s, r) => s + r.basisPoints, 0);
+      return total === 10000;
     });
 
     // Buscar inscrições do afiliado atual (se existir)
@@ -264,7 +276,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
 
     const myOfferMap = new Map(myEnrollments.map(e => [e.offerId, e.status]));
 
-    return reply.send(configs.map(c => ({
+    return reply.send(valid.map(c => ({
       offerId      : c.offerId,
       offerName    : c.offer.name,
       productName  : c.offer.product.name,
@@ -331,16 +343,26 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       include: {
         offer: {
           include: {
-            product      : { select: { name: true, imageUrl: true } },
+            product        : { select: { name: true, imageUrl: true, status: true, deletedAt: true } },
             affiliateConfig: { select: { commissionBps: true } },
+            splitRules     : { where: { isActive: true }, select: { basisPoints: true } },
           },
         },
       },
       orderBy: { createdAt: 'desc' },
     });
 
-    // Para cada inscrição, buscar estatísticas
-    const result = await Promise.all(enrollments.map(async (e) => {
+    // Filtra inscrições cujo produto/oferta deixou de ser vendável
+    // (evita mostrar link que retorna 404 no checkout)
+    const sellable = enrollments.filter(e => {
+      if (!e.offer.isActive || e.offer.deletedAt) return false;
+      if (e.offer.product.status !== 'APPROVED' || e.offer.product.deletedAt) return false;
+      const total = e.offer.splitRules.reduce((s, r) => s + r.basisPoints, 0);
+      return total === 10000;
+    });
+
+    // Para cada inscrição válida, buscar estatísticas
+    const result = await Promise.all(sellable.map(async (e) => {
       const [clicks, conversions, revenue] = await Promise.all([
         prisma.affiliateTracking.count({ where: { affiliateId: affiliate.id, offerId: e.offerId } }),
         prisma.affiliateTracking.count({ where: { affiliateId: affiliate.id, offerId: e.offerId, orderId: { not: null } } }),

@@ -6,6 +6,7 @@ import { AuditService } from '../audit/audit.service';
 import { logger } from '../../shared/utils/logger';
 import { whatsAppService } from '../../shared/services/whatsapp.service';
 import { Resend } from 'resend';
+import { enqueueNfe, enqueueLogistics } from '../../shared/queue/enqueue';
 
 const audit = new AuditService();
 
@@ -644,6 +645,24 @@ export async function adminRoutes(app: FastifyInstance) {
       }
     } else {
       results.whatsapp = 'pulado (sem digitalUrl ou telefone)';
+    }
+
+    // 4. Dispara NF-e para produtos digitais (worker filtra PHYSICAL)
+    try {
+      await enqueueNfe(orderId);
+      results.nfe = 'enfileirado';
+    } catch (err: any) {
+      results.nfe = `erro: ${err.message}`;
+    }
+
+    // 5. Cria shipment WAITING para produtos físicos (produtor despacha depois)
+    if (order.offer?.product?.type === 'PHYSICAL') {
+      try {
+        await enqueueLogistics(orderId);
+        results.logistics = 'enfileirado';
+      } catch (err: any) {
+        results.logistics = `erro: ${err.message}`;
+      }
     }
 
     return reply.send({ message: 'Pedido aprovado', results });
