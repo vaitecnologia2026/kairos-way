@@ -100,7 +100,7 @@ export async function producerRoutes(app: FastifyInstance) {
 
     const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
     if (!producer) throw new NotFoundError('Produtor');
-    if (producer.kycStatus === 'APPROVED') throw new AppError('Produtor já aprovado — dados bancários bloqueados', 400);
+    if (producer.kycStatus === 'APPROVED' && producer.pagarmeRecipientId) throw new AppError('Produtor já aprovado — dados bancários bloqueados', 400);
 
     await prisma.producer.update({
       where: { id: producer.id },
@@ -158,7 +158,7 @@ export async function producerRoutes(app: FastifyInstance) {
 
     const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
     if (!producer) throw new NotFoundError('Produtor');
-    if (producer.kycStatus === 'APPROVED') throw new AppError('Produtor já aprovado — dados bloqueados', 400);
+    if (producer.kycStatus === 'APPROVED' && producer.pagarmeRecipientId) throw new AppError('Produtor já aprovado — dados bloqueados', 400);
 
     const currentMeta = (producer.metadata as any) || {};
     await prisma.producer.update({
