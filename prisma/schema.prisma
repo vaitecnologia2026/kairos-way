@@ -267,13 +267,21 @@ model Producer {
 }
 
 model KycDocument {
-  id          String   @id @default(cuid())
-  producerId  String
-  type        String
-  url         String
-  uploadedAt  DateTime @default(now())
+  id              String    @id @default(cuid())
+  producerId      String
+  type            String
+  url             String
+  uploadedAt      DateTime  @default(now())
+  // Review do admin
+  status          String    @default("PENDING") // PENDING | APPROVED | NEEDS_ADJUSTMENT | REJECTED
+  reviewedAt      DateTime?
+  reviewedBy      String?
+  adjustmentReason String?
+  rejectionReason  String?
 
   producer Producer @relation(fields: [producerId], references: [id], onDelete: Cascade)
+
+  @@index([producerId, status])
 }
 
 // ══════════════════════════════════════════════════════

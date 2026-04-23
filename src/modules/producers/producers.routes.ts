@@ -232,6 +232,193 @@ export async function producerRoutes(app: FastifyInstance) {
     return reply.send({ message: 'Configuração salva' });
   });
 
+  // ══════════════════════════════════════════════════════════════
+  // REVIEW DE DOCUMENTOS KYC (admin)
+  // ══════════════════════════════════════════════════════════════
+
+  // GET /producers/:id/kyc-full — admin vê docs + dados cadastrais + bancários
+  app.get('/:id/kyc-full', {
+    preHandler: [authenticate, requireRole('ADMIN', 'STAFF')],
+  }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const producer = await prisma.producer.findUnique({
+      where  : { id },
+      include: {
+        user        : { select: { id: true, name: true, email: true, phone: true, document: true, createdAt: true } },
+        kycDocuments: { orderBy: { uploadedAt: 'desc' } },
+      },
+    });
+    if (!producer) throw new NotFoundError('Produtor');
+
+    return reply.send({
+      id                    : producer.id,
+      user                  : producer.user,
+      companyName           : producer.companyName,
+      kycStatus             : producer.kycStatus,
+      isActive              : producer.isActive,
+      approvedAt            : producer.approvedAt,
+      rejectedAt            : producer.rejectedAt,
+      rejectedReason        : producer.rejectedReason,
+      pagarmeRecipientId    : producer.pagarmeRecipientId,
+      pagarmeBankAccountId  : producer.pagarmeBankAccountId,
+      pagarmeRecipientStatus: producer.pagarmeRecipientStatus,
+      bankData              : producer.bankData,
+      registerInformation   : (producer.metadata as any)?.registerInformation ?? null,
+      documents             : producer.kycDocuments,
+    });
+  });
+
+  // POST /producers/:id/documents/:docId/approve — admin aprova documento
+  app.post('/:id/documents/:docId/approve', {
+    preHandler: [authenticate, requireRole('ADMIN', 'STAFF')],
+  }, async (req, reply) => {
+    const { id, docId } = req.params as { id: string; docId: string };
+
+    const doc = await prisma.kycDocument.findFirst({ where: { id: docId, producerId: id } });
+    if (!doc) throw new NotFoundError('Documento');
+
+    const updated = await prisma.kycDocument.update({
+      where: { id: docId },
+      data : {
+        status          : 'APPROVED',
+        reviewedAt      : new Date(),
+        reviewedBy      : req.user.sub,
+        adjustmentReason: null,
+        rejectionReason : null,
+      },
+    });
+
+    const producer = await prisma.producer.findUnique({ where: { id }, include: { user: true } });
+    if (producer) {
+      await prisma.notification.create({
+        data: {
+          userId: producer.userId,
+          type  : 'KYC_DOC_APPROVED',
+          title : 'Documento aprovado',
+          body  : `Seu documento ${doc.type} foi aprovado.`,
+        },
+      });
+    }
+
+    await auditService.log({
+      userId : req.user.sub,
+      action : 'KYC_DOC_APPROVED',
+      details: { docId, producerId: id, docType: doc.type },
+      level  : 'MEDIUM',
+    });
+
+    return reply.send(updated);
+  });
+
+  // POST /producers/:id/documents/:docId/request-adjustment — admin pede ajuste
+  app.post('/:id/documents/:docId/request-adjustment', {
+    preHandler: [authenticate, requireRole('ADMIN', 'STAFF')],
+  }, async (req, reply) => {
+    const { id, docId } = req.params as { id: string; docId: string };
+    const body = z.object({ reason: z.string().min(5, 'Explique o que precisa ser ajustado') }).parse(req.body);
+
+    const doc = await prisma.kycDocument.findFirst({ where: { id: docId, producerId: id } });
+    if (!doc) throw new NotFoundError('Documento');
+
+    const updated = await prisma.kycDocument.update({
+      where: { id: docId },
+      data : {
+        status          : 'NEEDS_ADJUSTMENT',
+        reviewedAt      : new Date(),
+        reviewedBy      : req.user.sub,
+        adjustmentReason: body.reason,
+      },
+    });
+
+    const producer = await prisma.producer.findUnique({ where: { id } });
+    if (producer) {
+      await prisma.notification.create({
+        data: {
+          userId: producer.userId,
+          type  : 'KYC_DOC_ADJUSTMENT',
+          title : 'Ajuste solicitado em documento',
+          body  : `Documento ${doc.type}: ${body.reason}`,
+        },
+      });
+    }
+
+    await auditService.log({
+      userId : req.user.sub,
+      action : 'KYC_DOC_ADJUSTMENT_REQUESTED',
+      details: { docId, producerId: id, reason: body.reason },
+      level  : 'MEDIUM',
+    });
+
+    return reply.send(updated);
+  });
+
+  // POST /producers/:id/documents/:docId/reject — admin rejeita doc permanentemente
+  app.post('/:id/documents/:docId/reject', {
+    preHandler: [authenticate, requireRole('ADMIN', 'STAFF')],
+  }, async (req, reply) => {
+    const { id, docId } = req.params as { id: string; docId: string };
+    const body = z.object({ reason: z.string().min(5) }).parse(req.body);
+
+    const doc = await prisma.kycDocument.findFirst({ where: { id: docId, producerId: id } });
+    if (!doc) throw new NotFoundError('Documento');
+
+    const updated = await prisma.kycDocument.update({
+      where: { id: docId },
+      data : {
+        status          : 'REJECTED',
+        reviewedAt      : new Date(),
+        reviewedBy      : req.user.sub,
+        rejectionReason : body.reason,
+      },
+    });
+
+    const producer = await prisma.producer.findUnique({ where: { id } });
+    if (producer) {
+      await prisma.notification.create({
+        data: {
+          userId: producer.userId,
+          type  : 'KYC_DOC_REJECTED',
+          title : 'Documento rejeitado',
+          body  : `Documento ${doc.type}: ${body.reason}`,
+        },
+      });
+    }
+
+    return reply.send(updated);
+  });
+
+  // POST /producers/:id/revoke-approval — cancela aprovação do produtor
+  app.post('/:id/revoke-approval', {
+    preHandler: [authenticate, requireRole('ADMIN')],
+  }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = z.object({ reason: z.string().min(5) }).parse(req.body);
+
+    const producer = await prisma.producer.update({
+      where  : { id },
+      data   : { kycStatus: 'DOCUMENTS_SENT', isActive: false, rejectedReason: body.reason },
+      include: { user: true },
+    });
+
+    await prisma.notification.create({
+      data: {
+        userId: producer.userId,
+        type  : 'KYC_REVOKED',
+        title : 'Aprovação cancelada',
+        body  : `Sua aprovação foi revogada: ${body.reason}`,
+      },
+    });
+
+    await auditService.log({
+      userId : req.user.sub,
+      action : 'PRODUCER_APPROVAL_REVOKED',
+      details: { producerId: id, reason: body.reason },
+      level  : 'HIGH',
+    });
+
+    return reply.send({ message: 'Aprovação revogada', producer });
+  });
+
   // ── GET /producers/dashboard ──────────────────────────────────
   app.get('/dashboard', {
     preHandler: [authenticate, requireRole('PRODUCER')],
