@@ -143,8 +143,8 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     return reply.send(affiliates);
   });
 
-  // POST /affiliates/:id/approve — produtor/admin aprova afiliado
-  app.post('/:id/approve', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'STAFF')] }, async (req, reply) => {
+  // POST /affiliates/:id/approve — somente ADMIN/STAFF aprova afiliado
+  app.post('/:id/approve', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
     const { id } = req.params as { id: string };
 
     const affiliate = await prisma.affiliate.findUnique({
@@ -177,8 +177,8 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     return reply.send({ message: 'Afiliado aprovado com sucesso!' });
   });
 
-  // POST /affiliates/:id/reject — produtor/admin rejeita afiliado
-  app.post('/:id/reject', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'STAFF')] }, async (req, reply) => {
+  // POST /affiliates/:id/reject — somente ADMIN/STAFF rejeita afiliado
+  app.post('/:id/reject', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const { reason } = z.object({ reason: z.string().optional() }).parse(req.body);
 
