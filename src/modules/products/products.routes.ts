@@ -50,7 +50,12 @@ export async function productRoutes(app: FastifyInstance) {
     const [data, total] = await Promise.all([
       prisma.product.findMany({
         where: { producerId, status: status || undefined, deletedAt: null },
-        include: { offers: { where: { isActive: true }, select: { id: true, name: true, priceCents: true, slug: true, type: true } } },
+        include: {
+          offers: {
+            where: { isActive: true },
+            include: { splitRules: { where: { isActive: true } } },
+          },
+        },
         orderBy: { createdAt: 'desc' },
         skip, take: Number(limit),
       }),
@@ -70,7 +75,7 @@ export async function productRoutes(app: FastifyInstance) {
       prisma.product.findMany({
         where: { status: status || undefined, deletedAt: null },
         include: {
-          offers  : { where: { isActive: true }, select: { id: true, name: true, priceCents: true, slug: true, type: true } },
+          offers  : { where: { isActive: true }, include: { splitRules: { where: { isActive: true } } } },
           producer: { include: { user: { select: { name: true, email: true } } } },
         },
         orderBy: { createdAt: 'desc' },

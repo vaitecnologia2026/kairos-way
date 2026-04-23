@@ -50,12 +50,22 @@ export async function checkoutRoutes(app: FastifyInstance) {
           product: {
             include: { producer: { select: { metadata: true } } },
           },
+          splitRules    : { where: { isActive: true } },
           checkoutConfig: true,
         },
       }),
       prisma.platformConfig.findUnique({ where: { key: 'checkout_success_message' } }),
     ]);
     if (!offer) throw new NotFoundError('Oferta');
+
+    // Regra: só vende se produto APROVADO + splits somando 10000 bps (100%)
+    if ((offer.product as any).status !== 'APPROVED') {
+      throw new NotFoundError('Oferta');
+    }
+    const totalBps = offer.splitRules.reduce((sum: number, r: any) => sum + r.basisPoints, 0);
+    if (offer.splitRules.length === 0 || totalBps !== 10000) {
+      throw new NotFoundError('Oferta');
+    }
 
     // Rastrear clique de afiliado (fire-and-forget)
     if (aff) {
@@ -113,9 +123,17 @@ export async function checkoutRoutes(app: FastifyInstance) {
 
     const offer = await prisma.offer.findUnique({
       where  : { slug, isActive: true, deletedAt: null },
-      include: { product: true },
+      include: { product: true, splitRules: { where: { isActive: true } } },
     });
     if (!offer) throw new NotFoundError('Oferta');
+
+    if ((offer.product as any).status !== 'APPROVED') {
+      throw new NotFoundError('Oferta');
+    }
+    const totalBpsPay = offer.splitRules.reduce((sum: number, r: any) => sum + r.basisPoints, 0);
+    if (offer.splitRules.length === 0 || totalBpsPay !== 10000) {
+      throw new AppError('Oferta não está pronta para vendas — faltam splits ou aprovação.', 422);
+    }
 
     let affiliateId: string | undefined;
     if (aff) {
