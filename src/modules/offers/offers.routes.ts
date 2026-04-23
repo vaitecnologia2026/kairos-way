@@ -56,7 +56,7 @@ export async function offerRoutes(app: FastifyInstance) {
       prisma.offer.findUnique({
         where: { slug, isActive: true },
         include: {
-          product: { select: { name: true, description: true, imageUrl: true, type: true, successMessage: true } },
+          product: { select: { name: true, description: true, imageUrl: true, type: true, status: true, successMessage: true } },
           splitRules: { where: { isActive: true } },
           checkoutConfig: true,
         },
@@ -64,6 +64,17 @@ export async function offerRoutes(app: FastifyInstance) {
       prisma.platformConfig.findUnique({ where: { key: 'checkout_success_message' } }),
     ]);
     if (!offer) throw new NotFoundError('Oferta');
+
+    // Regra de negócio: produto precisa estar APROVADO e splits somando 10000 bps (100%)
+    // Caso contrário, bloqueia o checkout para evitar venda fantasma.
+    const status = (offer.product as any).status;
+    if (status !== 'APPROVED') {
+      throw new NotFoundError('Oferta');   // 404 em vez de 422 para não vazar status interno
+    }
+    const totalBps = offer.splitRules.reduce((sum: number, r: any) => sum + r.basisPoints, 0);
+    if (offer.splitRules.length === 0 || totalBps !== 10000) {
+      throw new NotFoundError('Oferta');
+    }
 
     const platformMsg = (platformConfig?.value as any)?.html ?? null;
     const successMessage = offer.product.successMessage ?? platformMsg;
