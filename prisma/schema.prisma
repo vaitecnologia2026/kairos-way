@@ -753,8 +753,15 @@ model SalesMilestone {
   targetType         String   @default("VALUE")    // "VALUE" | "UNITS"
   targetValue        Int                           // centavos se VALUE, quantidade se UNITS
   reward             String   @db.Text
-  termsAndConditions String?  @db.Text             // NOVO: termos e condições do marco
+  termsAndConditions String?  @db.Text             // termos e condições do marco (para afiliados)
   position           Int      @default(0)          // ordem exibição
+
+  // Aceite do produtor aos termos da plataforma (isenção de responsabilidade)
+  producerAcceptanceText String?  @db.Text         // frase digitada pelo produtor ("EU, FULANO...")
+  producerAcceptanceCpf  String?                   // CPF declarado no momento do aceite
+  producerAcceptanceIp   String?                   // IP da requisição do aceite
+  producerAcceptedAt     DateTime?                 // quando o produtor aceitou os termos
+
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 

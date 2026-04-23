@@ -25,8 +25,21 @@ const milestoneSchema = z.object({
   targetValue       : z.number().int().min(1),
   reward            : z.string().min(1).max(2000),
   position          : z.number().int().min(0).optional(),
-  termsAndConditions: z.string().max(10000).optional().nullable(), // NOVO
+  termsAndConditions: z.string().max(10000).optional().nullable(),
+  // Aceite obrigatório na criação (opcional na edição)
+  acceptanceText    : z.string().max(500).optional(),
+  acceptanceCpf     : z.string().max(20).optional(),
 });
+
+// Normaliza para comparação (remove acentos, pontuação, caixa)
+function normalizeAcceptance(s: string): string {
+  return (s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Z0-9\s]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toUpperCase();
+}
 
 export const milestoneRoutes: FastifyPluginAsync = async (app) => {
 
@@ -84,6 +97,33 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
     const userId = req.user.sub;
     const body   = milestoneSchema.parse(req.body);
 
+    // ── Exige aceite dos termos da plataforma ──
+    if (!body.acceptanceText || !body.acceptanceCpf) {
+      throw new AppError('É obrigatório aceitar os termos de responsabilidade para criar um marco.', 422);
+    }
+
+    const user = await prisma.user.findUnique({
+      where : { id: userId },
+      select: { name: true, document: true },
+    });
+    if (!user) throw new AppError('Usuário não encontrado', 404);
+
+    const userDoc = (user.document || '').replace(/\D/g, '');
+    const typedDoc = body.acceptanceCpf.replace(/\D/g, '');
+    if (!userDoc || userDoc !== typedDoc) {
+      throw new AppError('O CPF/CNPJ informado no aceite não confere com o cadastrado no perfil.', 422);
+    }
+
+    const expectedPhrase = `EU ${user.name} PORTADOR DO CPF ${userDoc} ACEITO OS TERMOS`;
+    const normalizedTyped = normalizeAcceptance(body.acceptanceText);
+    const normalizedExpected = normalizeAcceptance(expectedPhrase);
+    if (!normalizedTyped.includes(normalizedExpected)) {
+      throw new AppError(
+        `A frase de aceite não confere. Digite exatamente: "EU, ${user.name}, PORTADOR DO CPF ${userDoc}, ACEITO OS TERMOS"`,
+        422,
+      );
+    }
+
     // Cor automática se não fornecida
     let color = body.color;
     if (!color) {
@@ -114,7 +154,11 @@ export const milestoneRoutes: FastifyPluginAsync = async (app) => {
         targetValue       : body.targetValue,
         reward            : body.reward,
         position,
-        termsAndConditions: body.termsAndConditions ?? null, // NOVO
+        termsAndConditions: body.termsAndConditions ?? null,
+        producerAcceptanceText: body.acceptanceText,
+        producerAcceptanceCpf : userDoc,
+        producerAcceptanceIp  : req.ip,
+        producerAcceptedAt    : new Date(),
       },
     });
 
