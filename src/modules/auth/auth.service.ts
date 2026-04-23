@@ -189,7 +189,10 @@ export class AuthService {
         document    : data.document,
         phone       : data.phone,
         role        : 'PRODUCER',
-        isActive    : false,
+        // Login liberado em modo leitura. O guard requireProducerApproved bloqueia
+        // operações (criar produto, ofertas, splits) até o admin aprovar e criar
+        // o recebedor no Pagar.me.
+        isActive    : true,
         producer    : {
           create: { companyName: data.companyName, kycStatus: 'PENDING' },
         },
