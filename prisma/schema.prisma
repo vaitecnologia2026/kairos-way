@@ -181,9 +181,27 @@ model User {
   auditLogs     AuditLog[]
   pushTokens    PushToken[]
   notifications Notification[]
+  passwordResets PasswordResetCode[]
 
   @@index([email])
   @@index([role])
+}
+
+// Código de 6 dígitos para recuperação de senha — TTL 15min, máx 5 tentativas
+model PasswordResetCode {
+  id         String   @id @default(cuid())
+  userId     String
+  codeHash   String                    // SHA-256 do código (nunca armazenar em texto)
+  expiresAt  DateTime                  // now + 15min
+  attempts   Int      @default(0)
+  usedAt     DateTime?
+  requestIp  String?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
 model Session {
