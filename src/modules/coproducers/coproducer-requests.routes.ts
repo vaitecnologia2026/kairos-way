@@ -24,12 +24,16 @@ export async function coproducerRequestRoutes(app: FastifyInstance) {
       return reply.status(400).send({ message: 'Somente afiliados podem solicitar ser co-produtor.' });
     }
 
-    // Verificar se já existe solicitação pendente
+    // Bloqueia duplicata: pendente OU já aprovada.
+    // Rejeitado fica de fora pra permitir nova tentativa.
     const existing = await prisma.coproducerRequest.findFirst({
-      where: { userId: req.user.sub, productId: null, status: 'PENDING' },
+      where: { userId: req.user.sub, productId: null, status: { in: ['PENDING', 'APPROVED'] } },
     });
     if (existing) {
-      return reply.status(409).send({ message: 'Você já tem uma solicitação em análise.', status: 'PENDING' });
+      const message = existing.status === 'APPROVED'
+        ? 'Você já é co-produtor aprovado.'
+        : 'Você já tem uma solicitação em análise.';
+      return reply.status(409).send({ message, status: existing.status });
     }
 
     const request = await prisma.coproducerRequest.create({
