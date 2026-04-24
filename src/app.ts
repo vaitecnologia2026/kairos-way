@@ -9,6 +9,7 @@ import { prisma } from './shared/utils/prisma';
 import { redis } from './shared/utils/redis';
 import { logger } from './shared/utils/logger';
 import { AppError } from './shared/errors/AppError';
+import { ZodError } from 'zod';
 
 // Routes
 import { uploadRoutes } from './modules/upload/upload.routes';
@@ -116,6 +117,18 @@ async function bootstrap() {
         error: 'Validation Error',
         message: error.message,
         details: error.validation,
+      });
+    }
+
+    if (error instanceof ZodError) {
+      const first = error.issues[0];
+      const path = first?.path?.join('.');
+      const message = path ? `${path}: ${first.message}` : (first?.message || 'Dados inválidos');
+      return reply.status(400).send({
+        statusCode: 400,
+        error: 'Validation Error',
+        message,
+        details: error.issues,
       });
     }
 
