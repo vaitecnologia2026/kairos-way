@@ -48,8 +48,16 @@ const app = Fastify({
 
 async function bootstrap() {
   // ── PLUGINS ──────────────────────────────────────────────────
+  const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
   await app.register(cors, {
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error(`Origin ${origin} not allowed by CORS`), false);
+    },
     credentials: true,
   });
 
