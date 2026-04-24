@@ -7,6 +7,7 @@ import { logger } from '../../shared/utils/logger';
 import { whatsAppService } from '../../shared/services/whatsapp.service';
 import { Resend } from 'resend';
 import { enqueueNfe, enqueueLogistics } from '../../shared/queue/enqueue';
+import { notifyNewSale } from '../../shared/utils/notifyNewSale';
 
 const audit = new AuditService();
 
@@ -515,6 +516,8 @@ export async function adminRoutes(app: FastifyInstance) {
     });
 
     // 1b. Criar SplitRecords se ainda não existirem
+    let affiliateUserIdForNotif: string | undefined;
+    let commissionCentsForNotif: number | undefined;
     try {
       const existingSplits = await prisma.splitRecord.count({ where: { orderId } });
       if (existingSplits === 0 && order.offerId) {
@@ -557,6 +560,8 @@ export async function adminRoutes(app: FastifyInstance) {
           });
           if (config && config.commissionBps > 0) {
             const commissionCents = Math.floor(order.amountCents * config.commissionBps / 10000);
+            affiliateUserIdForNotif = affiliate.userId;
+            commissionCentsForNotif = commissionCents;
             const alreadyHasAffiliateSplit = await prisma.splitRecord.count({
               where: { orderId, recipientType: 'AFFILIATE' },
             });
@@ -663,6 +668,26 @@ export async function adminRoutes(app: FastifyInstance) {
       } catch (err: any) {
         results.logistics = `erro: ${err.message}`;
       }
+    }
+
+    // 6. Sino: NEW_SALE para o produtor, NEW_COMMISSION para o afiliado (se houver)
+    try {
+      const producerId = order.offer?.product?.producerId;
+      if (producerId) {
+        await notifyNewSale({
+          orderId,
+          productName,
+          amountCents    : order.amountCents,
+          producerId,
+          affiliateUserId: affiliateUserIdForNotif,
+          commissionCents: commissionCentsForNotif,
+        });
+        results.notify = 'ok';
+      } else {
+        results.notify = 'pulado (sem producerId)';
+      }
+    } catch (err: any) {
+      results.notify = `erro: ${err.message}`;
     }
 
     return reply.send({ message: 'Pedido aprovado', results });
