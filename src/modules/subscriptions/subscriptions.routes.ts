@@ -17,7 +17,13 @@ export async function subscriptionRoutes(app: FastifyInstance) {
     const where: any = { status: status || undefined };
     if (req.user.role === 'PRODUCER') {
       const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
-      where.offer = { product: { producerId: producer?.id } };
+      const offers   = producer
+        ? await prisma.offer.findMany({
+            where : { product: { producerId: producer.id } },
+            select: { id: true },
+          })
+        : [];
+      where.offerId = { in: offers.map(o => o.id) };
     }
 
     const [data, total] = await Promise.all([
