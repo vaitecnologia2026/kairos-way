@@ -6,6 +6,7 @@ import { prisma } from '../../shared/utils/prisma';
 import { NotFoundError, AppError } from '../../shared/errors/AppError';
 import { enqueueEmail } from '../../shared/queue/enqueue';
 import { pagarmeRecipients } from '../../shared/services/pagarme-recipients.service';
+import { notifications, NotifType } from '../../shared/notifications/notification.service';
 
 const auditService = new AuditService();
 
@@ -288,17 +289,12 @@ export async function producerRoutes(app: FastifyInstance) {
       },
     });
 
-    const producer = await prisma.producer.findUnique({ where: { id }, include: { user: true } });
-    if (producer) {
-      await prisma.notification.create({
-        data: {
-          userId: producer.userId,
-          type  : 'KYC_DOC_APPROVED',
-          title : 'Documento aprovado',
-          body  : `Seu documento ${doc.type} foi aprovado.`,
-        },
-      });
-    }
+    await notifications.notify({
+      recipient: { kind: 'producer', producerId: id },
+      type     : NotifType.KYC_DOC_APPROVED,
+      title    : 'Documento aprovado',
+      body     : `Seu documento ${doc.type} foi aprovado.`,
+    });
 
     await auditService.log({
       userId : req.user.sub,
@@ -330,17 +326,12 @@ export async function producerRoutes(app: FastifyInstance) {
       },
     });
 
-    const producer = await prisma.producer.findUnique({ where: { id } });
-    if (producer) {
-      await prisma.notification.create({
-        data: {
-          userId: producer.userId,
-          type  : 'KYC_DOC_ADJUSTMENT',
-          title : 'Ajuste solicitado em documento',
-          body  : `Documento ${doc.type}: ${body.reason}`,
-        },
-      });
-    }
+    await notifications.notify({
+      recipient: { kind: 'producer', producerId: id },
+      type     : NotifType.KYC_DOC_ADJUSTMENT,
+      title    : 'Ajuste solicitado em documento',
+      body     : `Documento ${doc.type}: ${body.reason}`,
+    });
 
     await auditService.log({
       userId : req.user.sub,
@@ -372,17 +363,12 @@ export async function producerRoutes(app: FastifyInstance) {
       },
     });
 
-    const producer = await prisma.producer.findUnique({ where: { id } });
-    if (producer) {
-      await prisma.notification.create({
-        data: {
-          userId: producer.userId,
-          type  : 'KYC_DOC_REJECTED',
-          title : 'Documento rejeitado',
-          body  : `Documento ${doc.type}: ${body.reason}`,
-        },
-      });
-    }
+    await notifications.notify({
+      recipient: { kind: 'producer', producerId: id },
+      type     : NotifType.KYC_DOC_REJECTED,
+      title    : 'Documento rejeitado',
+      body     : `Documento ${doc.type}: ${body.reason}`,
+    });
 
     return reply.send(updated);
   });
@@ -400,13 +386,11 @@ export async function producerRoutes(app: FastifyInstance) {
       include: { user: true },
     });
 
-    await prisma.notification.create({
-      data: {
-        userId: producer.userId,
-        type  : 'KYC_REVOKED',
-        title : 'Aprovação cancelada',
-        body  : `Sua aprovação foi revogada: ${body.reason}`,
-      },
+    await notifications.notify({
+      recipient: { kind: 'user', userId: producer.userId },
+      type     : NotifType.KYC_REVOKED,
+      title    : 'Aprovação cancelada',
+      body     : `Sua aprovação foi revogada: ${body.reason}`,
     });
 
     await auditService.log({

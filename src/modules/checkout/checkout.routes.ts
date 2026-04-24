@@ -305,7 +305,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
           orderId        : order.id,
           productName    : offer.product.name,
           amountCents    : offer.priceCents,
-          producerUserId : offer.product.producerId,
+          producerId     : offer.product.producerId,  // Producer.id — service resolve User.id
           affiliateUserId: notifAffiliateUserId,
           commissionCents: notifCommissionCents,
         });

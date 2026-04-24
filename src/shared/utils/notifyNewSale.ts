@@ -1,47 +1,42 @@
-import { prisma } from './prisma';
-import { logger } from './logger';
+import { notifications, NotifType } from '../notifications/notification.service';
 
 /**
  * Cria notificações de "nova venda" para o produtor e, se houver, para o afiliado.
- * Fire-and-forget — nunca lança exceção para não quebrar o fluxo principal.
+ * Delega ao NotificationService para resolver os User.id corretos via tipos.
+ *
+ * ATENÇÃO: `producerId` aqui é o Producer.id (Product.producerId). O service faz o
+ * lookup para User.id antes de persistir. Isso corrige o bug silencioso anterior
+ * onde passávamos Producer.id como se fosse User.id e a FK quebrava.
  */
 export async function notifyNewSale(params: {
-  orderId        : string;
-  productName    : string;
-  amountCents    : number;
-  producerUserId : string;
+  orderId         : string;
+  productName     : string;
+  amountCents     : number;
+  /** Producer.id — o service resolve para Producer.userId automaticamente. */
+  producerId      : string;
+  /** Já é User.id (Affiliate.userId). */
   affiliateUserId?: string;
   commissionCents?: number;
 }): Promise<void> {
-  const { orderId, productName, amountCents, producerUserId, affiliateUserId, commissionCents } = params;
+  const { orderId, productName, amountCents, producerId, affiliateUserId, commissionCents } = params;
 
-  const fmt = (cents: number) =>
-    `R$ ${(cents / 100).toFixed(2).replace('.', ',')}`;
+  const fmt = (cents: number) => `R$ ${(cents / 100).toFixed(2).replace('.', ',')}`;
 
-  const creates: Parameters<typeof prisma.notification.createMany>[0]['data'] = [
-    {
-      userId : producerUserId,
-      type   : 'NEW_SALE',
-      title  : '💰 Nova venda aprovada!',
-      body   : `${fmt(amountCents)} — ${productName}`,
-      orderId,
-    },
-  ];
+  await notifications.notify({
+    recipient: { kind: 'producer', producerId },
+    type     : NotifType.NEW_SALE,
+    title    : '💰 Nova venda aprovada!',
+    body     : `${fmt(amountCents)} — ${productName}`,
+    orderId,
+  });
 
   if (affiliateUserId && commissionCents && commissionCents > 0) {
-    creates.push({
-      userId : affiliateUserId,
-      type   : 'NEW_SALE',
-      title  : '🎉 Nova comissão gerada!',
-      body   : `${fmt(commissionCents)} de comissão — ${productName}`,
+    await notifications.notify({
+      recipient: { kind: 'user', userId: affiliateUserId },
+      type     : NotifType.NEW_COMMISSION,
+      title    : '🎉 Nova comissão gerada!',
+      body     : `${fmt(commissionCents)} de comissão — ${productName}`,
       orderId,
     });
-  }
-
-  try {
-    await prisma.notification.createMany({ data: creates });
-    logger.info({ orderId, producerUserId, affiliateUserId }, 'Notificações de venda criadas');
-  } catch (err: any) {
-    logger.warn({ err: err.message, orderId }, 'Falha ao criar notificações de venda — não crítico');
   }
 }

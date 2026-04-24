@@ -170,7 +170,7 @@ async function aprovarPedidoReconciliacao(orderId: string): Promise<void> {
     }
   }
 
-  await notifyNewSale({ orderId, productName: order.offer.product.name, amountCents: order.amountCents, producerUserId, affiliateUserId, commissionCents });
+  await notifyNewSale({ orderId, productName: order.offer.product.name, amountCents: order.amountCents, producerId: producerUserId, affiliateUserId, commissionCents });
   logger.info({ orderId }, 'Reconciliação: splits criados e produtor notificado');
 }
 

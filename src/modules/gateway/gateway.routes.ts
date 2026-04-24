@@ -65,7 +65,7 @@ async function criarSplitsSeNecessario(orderId: string): Promise<void> {
     }
   }
 
-  await notifyNewSale({ orderId, productName: order.offer.product.name, amountCents: order.amountCents, producerUserId, affiliateUserId, commissionCents });
+  await notifyNewSale({ orderId, productName: order.offer.product.name, amountCents: order.amountCents, producerId: producerUserId, affiliateUserId, commissionCents });
 }
 
 export async function gatewayRoutes(app: FastifyInstance) {

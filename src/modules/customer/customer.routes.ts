@@ -7,6 +7,7 @@ import { AppError } from '../../shared/errors/AppError';
 import { AuditService } from '../audit/audit.service';
 import { GatewayService } from '../gateway/gateway.service';
 import { AcquirerName } from '@prisma/client';
+import { notifications, NotifType } from '../../shared/notifications/notification.service';
 
 const auditService = new AuditService();
 const gateway      = new GatewayService();
@@ -14,11 +15,6 @@ const gateway      = new GatewayService();
 /** Formata centavos em "R$ X,XX" para uso em notificações */
 function fmtBRL(cents: number) {
   return `R$ ${(cents / 100).toFixed(2).replace('.', ',')}`;
-}
-
-/** Cria notificação para um usuário (fire-and-forget) */
-async function notify(userId: string, type: string, title: string, body: string, orderId?: string) {
-  await prisma.notification.create({ data: { userId, type, title, body, orderId } }).catch(() => {});
 }
 
 // ── SCHEMAS ───────────────────────────────────────────────────────────────────
@@ -234,27 +230,31 @@ export const customerRoutes: FastifyPluginAsync = async (app) => {
       });
     }
 
-    // ── Notifica produtor ────────────────────────────────────────
+    // ── Notifica produtor (resolve User.id via producerId) ──────
     const producerId = order.offer?.product?.producerId;
     if (producerId) {
-      const title = refundStatus === 'PROCESSED'
-        ? `Reembolso processado — ${productName}`
-        : `Solicitação de reembolso — ${productName}`;
-      const body  = refundStatus === 'PROCESSED'
-        ? `${amountFmt} reembolsado para o cliente (pedido #${shortId}). Motivo: ${reason}.`
-        : `O cliente solicitou reembolso de ${amountFmt} (pedido #${shortId}). Aguarda análise manual. Motivo: ${reason}.`;
-      await notify(producerId, 'REFUND_PROCESSED', title, body, orderId);
+      await notifications.notify({
+        recipient: { kind: 'producer', producerId },
+        type     : refundStatus === 'PROCESSED' ? NotifType.REFUND_PROCESSED : NotifType.REFUND_REQUESTED,
+        title    : refundStatus === 'PROCESSED'
+          ? `Reembolso processado — ${productName}`
+          : `Solicitação de reembolso — ${productName}`,
+        body     : refundStatus === 'PROCESSED'
+          ? `${amountFmt} reembolsado para o cliente (pedido #${shortId}). Motivo: ${reason}.`
+          : `O cliente solicitou reembolso de ${amountFmt} (pedido #${shortId}). Aguarda análise manual. Motivo: ${reason}.`,
+        orderId,
+      });
     }
 
-    // ── Notifica afiliado (se houver) ────────────────────────────
+    // ── Notifica afiliado (se houver) — affiliate.userId já é User.id ──
     if (order.affiliate?.userId) {
-      await notify(
-        order.affiliate.userId,
-        'REFUND_PROCESSED',
-        `Comissão cancelada — ${productName}`,
-        `A venda de ${amountFmt} foi reembolsada (pedido #${shortId}). Sua comissão foi estornada.`,
-        orderId
-      );
+      await notifications.notify({
+        recipient: { kind: 'user', userId: order.affiliate.userId },
+        type     : NotifType.COMMISSION_CANCELLED,
+        title    : `Comissão cancelada — ${productName}`,
+        body     : `A venda de ${amountFmt} foi reembolsada (pedido #${shortId}). Sua comissão foi estornada.`,
+        orderId,
+      });
     }
 
     await auditService.log({

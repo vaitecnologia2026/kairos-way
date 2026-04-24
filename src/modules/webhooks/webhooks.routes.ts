@@ -99,7 +99,7 @@ async function criarSplitsAposAprovacao(orderId: string): Promise<void> {
     orderId,
     productName    : order.offer.product.name,
     amountCents    : order.amountCents,
-    producerUserId,
+    producerId     : producerUserId,  // variável legada — é Product.producerId = Producer.id
     affiliateUserId,
     commissionCents,
   });
