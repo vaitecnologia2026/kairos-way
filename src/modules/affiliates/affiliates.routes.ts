@@ -752,4 +752,178 @@ export async function affiliatesRoutes(app: FastifyInstance) {
 
     return reply.send({ ok: true });
   });
+
+  // ─── LINK DE AFILIAÇÃO DIRETA POR OFERTA ─────────────────────────────────
+
+  // GET /affiliates/invite/:offerSlug — info pública da oferta para a página de convite
+  app.get('/invite/:offerSlug', async (req, reply) => {
+    const { offerSlug } = req.params as { offerSlug: string };
+
+    const offer = await prisma.offer.findFirst({
+      where  : { slug: offerSlug, isActive: true, deletedAt: null },
+      include: {
+        product   : { select: { name: true, imageUrl: true, status: true, deletedAt: true, producer: { select: { user: { select: { name: true } } } } } },
+        splitRules: { where: { isActive: true }, select: { basisPoints: true } },
+      },
+    });
+
+    if (!offer) return reply.status(404).send({ message: 'Oferta não encontrada' });
+    if (offer.product.deletedAt || offer.product.status !== 'APPROVED') {
+      return reply.status(404).send({ message: 'Oferta indisponível para afiliação' });
+    }
+
+    const config = await prisma.affiliateConfig.findUnique({
+      where: { offerId: offer.id },
+    });
+    if (!config || !config.enabled) {
+      return reply.status(404).send({ message: 'O produtor ainda não habilitou afiliação para esta oferta' });
+    }
+
+    const splitTotal = offer.splitRules.reduce((s, r) => s + r.basisPoints, 0);
+    if (splitTotal !== 10000) {
+      return reply.status(422).send({ message: 'Oferta sem splits configurados' });
+    }
+
+    return reply.send({
+      offerId      : offer.id,
+      offerName    : offer.name,
+      productName  : offer.product.name,
+      productImage : offer.product.imageUrl,
+      producerName : offer.product.producer?.user?.name || null,
+      priceCents   : offer.priceCents,
+      commissionBps: config.commissionBps,
+      commissionPct: config.commissionBps / 100,
+      cookieDays   : config.cookieDays,
+      description  : config.description,
+    });
+  });
+
+  // POST /affiliates/invite/:offerSlug/register — cadastra afiliado e já cria enrollment
+  app.post('/invite/:offerSlug/register', async (req, reply) => {
+    const { offerSlug } = req.params as { offerSlug: string };
+    const body = z.object({
+      name    : z.string().min(2),
+      email   : z.string().email(),
+      password: z.string().min(6),
+      phone   : z.string().optional(),
+      document: z.string().optional(),
+    }).parse(req.body);
+
+    const offer = await prisma.offer.findFirst({
+      where  : { slug: offerSlug, isActive: true, deletedAt: null },
+      include: { product: { select: { status: true, deletedAt: true } } },
+    });
+    if (!offer || offer.product.deletedAt || offer.product.status !== 'APPROVED') {
+      return reply.status(404).send({ message: 'Oferta não encontrada' });
+    }
+
+    const config = await prisma.affiliateConfig.findUnique({ where: { offerId: offer.id } });
+    if (!config || !config.enabled) {
+      return reply.status(404).send({ message: 'Afiliação não habilitada para esta oferta' });
+    }
+
+    const splitCount = await prisma.splitRule.count({ where: { offerId: offer.id, isActive: true } });
+    if (splitCount === 0) {
+      return reply.status(422).send({ message: 'Oferta ainda não tem splits configurados.' });
+    }
+
+    const existing = await prisma.user.findUnique({ where: { email: body.email } });
+    if (existing) {
+      return reply.status(409).send({ message: 'E-mail já cadastrado. Faça login para se afiliar.' });
+    }
+
+    const passwordHash = await bcrypt.hash(body.password, 12);
+
+    const result = await prisma.$transaction(async tx => {
+      const user = await tx.user.create({
+        data: {
+          name    : body.name,
+          email   : body.email,
+          passwordHash,
+          role    : 'AFFILIATE',
+          phone   : body.phone,
+          document: body.document,
+          isActive: false, // aprovação do admin libera
+        },
+      });
+
+      const affiliate = await tx.affiliate.create({
+        data: {
+          userId  : user.id,
+          code    : createId().slice(0, 8).toUpperCase(),
+          isActive: false,
+          status  : 'PENDING',
+        },
+      });
+
+      const enrollment = await tx.affiliateEnrollment.create({
+        data: {
+          affiliateId: affiliate.id,
+          offerId    : offer.id,
+          status     : 'ACTIVE',
+          link       : `${process.env.FRONTEND_URL}/checkout/${offer.slug}?ref=${affiliate.code}`,
+        },
+      });
+
+      return { user, affiliate, enrollment };
+    });
+
+    logger.info({ userId: result.user.id, offerId: offer.id, source: 'invite-link' }, 'Afiliado: cadastro via link direto — aguardando aprovação');
+
+    const { notifyAffiliatePending } = await import('../../shared/utils/notify');
+    await notifyAffiliatePending(body.name);
+
+    return reply.status(201).send({
+      message: 'Cadastro realizado! Aguarde a aprovação para começar a divulgar.',
+    });
+  });
+
+  // POST /affiliates/invite/:offerSlug/enroll — afiliado já logado se afilia direto
+  app.post('/invite/:offerSlug/enroll', { preHandler: [authenticate] }, async (req, reply) => {
+    const { offerSlug } = req.params as { offerSlug: string };
+
+    const offer = await prisma.offer.findFirst({
+      where : { slug: offerSlug, isActive: true, deletedAt: null },
+      select: { id: true, slug: true, product: { select: { status: true, deletedAt: true } } },
+    });
+    if (!offer || offer.product.deletedAt || offer.product.status !== 'APPROVED') {
+      return reply.status(404).send({ message: 'Oferta não encontrada' });
+    }
+
+    const config = await prisma.affiliateConfig.findUnique({ where: { offerId: offer.id } });
+    if (!config || !config.enabled) {
+      return reply.status(404).send({ message: 'Afiliação não habilitada para esta oferta' });
+    }
+
+    const splitCount = await prisma.splitRule.count({ where: { offerId: offer.id, isActive: true } });
+    if (splitCount === 0) {
+      return reply.status(422).send({ message: 'Oferta ainda não tem splits configurados.' });
+    }
+
+    let affiliate = await prisma.affiliate.findUnique({ where: { userId: req.user.sub } });
+    if (!affiliate) {
+      affiliate = await prisma.affiliate.create({
+        data: {
+          userId: req.user.sub,
+          code  : createId().slice(0, 8).toUpperCase(),
+        },
+      });
+    }
+
+    const existing = await prisma.affiliateEnrollment.findUnique({
+      where: { affiliateId_offerId: { affiliateId: affiliate.id, offerId: offer.id } },
+    });
+    if (existing) return reply.send({ alreadyEnrolled: true, enrollment: existing });
+
+    const enrollment = await prisma.affiliateEnrollment.create({
+      data: {
+        affiliateId: affiliate.id,
+        offerId    : offer.id,
+        status     : 'ACTIVE',
+        link       : `${process.env.FRONTEND_URL}/checkout/${offer.slug}?ref=${affiliate.code}`,
+      },
+    });
+
+    return reply.status(201).send({ alreadyEnrolled: false, enrollment });
+  });
 }

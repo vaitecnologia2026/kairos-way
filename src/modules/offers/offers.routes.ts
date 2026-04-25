@@ -101,7 +101,7 @@ export async function offerRoutes(app: FastifyInstance) {
     const { id } = req.params as { id: string };
     const body = z.object({
       splits: z.array(z.object({
-        recipientType: z.enum(['PLATFORM', 'PRODUCER', 'COPRODUCER', 'AFFILIATE']),
+        recipientType: z.enum(['PLATFORM', 'PRODUCER']),
         recipientId: z.string().optional(),
         basisPoints: z.number().int().positive(),
         description: z.string().optional(),
