@@ -135,6 +135,14 @@ export async function productRoutes(app: FastifyInstance) {
       showInMarketplace : z.boolean().optional(),
     }).parse(req.body);
 
+    // Guard: showInMarketplace=true só com produto APPROVED
+    if (body.showInMarketplace === true) {
+      const current = await prisma.product.findUnique({ where: { id }, select: { status: true } });
+      if (current?.status !== 'APPROVED') {
+        throw new AppError('O produto precisa estar aprovado para ser exibido na vitrine.', 422);
+      }
+    }
+
     const product = await prisma.product.update({
       where: { id, deletedAt: null },
       data: body,
