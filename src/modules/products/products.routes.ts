@@ -189,4 +189,27 @@ export async function productRoutes(app: FastifyInstance) {
     await auditService.log({ userId: req.user.sub, action: 'PRODUCT_REJECTED', resource: `product:${id}`, level: 'MEDIUM' });
     return reply.send({ message: 'Produto rejeitado' });
   });
+
+  // POST /products/:id/request-changes (admin) — move pra REVIEW e envia mensagem ao produtor
+  app.post('/:id/request-changes', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const parsed = z.object({ reason: z.string().min(5) }).safeParse(req.body);
+    if (!parsed.success) throw new AppError('O motivo deve ter pelo menos 5 caracteres', 400);
+
+    const existing = await prisma.product.findUnique({ where: { id } });
+    if (!existing) throw new AppError('Produto não encontrado', 404);
+    if (!['PENDING', 'REVIEW'].includes(existing.status)) {
+      throw new AppError(`Produto não pode ser revisado (status atual: ${existing.status})`, 409);
+    }
+
+    await prisma.product.update({
+      where: { id },
+      data : { status: 'REVIEW', rejectedReason: parsed.data.reason },
+    });
+    await auditService.log({
+      userId: req.user.sub, action: 'PRODUCT_REVIEW_REQUESTED', resource: `product:${id}`,
+      level : 'LOW', details: { reason: parsed.data.reason },
+    });
+    return reply.send({ message: 'Solicitação de alteração enviada' });
+  });
 }

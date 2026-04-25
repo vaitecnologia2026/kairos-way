@@ -692,4 +692,235 @@ export async function adminRoutes(app: FastifyInstance) {
 
     return reply.send({ message: 'Pedido aprovado', results });
   });
+
+  // ─── SALDO GLOBAL DE PRODUTORES ──────────────────────────────────────────
+  // GET /admin/balances — lista saldo (disponível, pendente, retido) de todos os produtores
+  app.get('/balances', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { search, sortBy } = req.query as { search?: string; sortBy?: string };
+
+    const producers = await prisma.producer.findMany({
+      where  : search ? { OR: [
+        { user: { name : { contains: search, mode: 'insensitive' } } },
+        { user: { email: { contains: search, mode: 'insensitive' } } },
+      ]} : undefined,
+      include: { user: { select: { id: true, name: true, email: true } } },
+    });
+
+    const now = new Date();
+    const userIds = producers.map(p => p.userId);
+
+    const [released, notReleased, withdrawals] = await Promise.all([
+      prisma.splitRecord.groupBy({
+        by    : ['recipientId'],
+        where : { recipientId: { in: userIds }, status: { in: ['PAID', 'PENDING'] }, OR: [{ availableAt: null }, { availableAt: { lte: now } }] },
+        _sum  : { amountCents: true },
+      }),
+      prisma.splitRecord.groupBy({
+        by    : ['recipientId'],
+        where : { recipientId: { in: userIds }, status: 'PENDING', availableAt: { gt: now } },
+        _sum  : { amountCents: true },
+      }),
+      prisma.withdrawal.groupBy({
+        by    : ['userId'],
+        where : { userId: { in: userIds }, status: { in: ['PAID', 'PROCESSING'] } },
+        _sum  : { amountCents: true },
+      }),
+    ]);
+
+    const releasedMap   = new Map(released   .filter(r => r.recipientId).map(r => [r.recipientId!, r._sum.amountCents || 0]));
+    const pendingMap    = new Map(notReleased.filter(r => r.recipientId).map(r => [r.recipientId!, r._sum.amountCents || 0]));
+    const withdrawnMap  = new Map(withdrawals.map(w => [w.userId, w._sum.amountCents || 0]));
+
+    const rows = producers.map(p => {
+      const totalReleased  = releasedMap.get(p.userId) || 0;
+      const totalWithdrawn = withdrawnMap.get(p.userId) || 0;
+      const availableCents = Math.max(0, totalReleased - totalWithdrawn);
+      const pendingCents   = pendingMap.get(p.userId) || 0;
+      return {
+        producerId : p.id,
+        userId     : p.userId,
+        name       : p.user.name,
+        email      : p.user.email,
+        availableCents,
+        pendingCents,
+        retainedCents: 0, // TODO: integrar com retenção da adquirente quando houver
+      };
+    });
+
+    const sortKey = sortBy === 'pending' ? 'pendingCents' : sortBy === 'name' ? 'name' : 'availableCents';
+    rows.sort((a, b) => {
+      if (sortKey === 'name') return (a.name || '').localeCompare(b.name || '');
+      return (b as any)[sortKey] - (a as any)[sortKey];
+    });
+
+    return reply.send(rows);
+  });
+
+  // ─── RECEBIMENTOS POR DIA ────────────────────────────────────────────────
+  // GET /admin/receivables?date=YYYY-MM-DD — total a receber pra plataforma + breakdown
+  app.get('/receivables', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { date } = req.query as { date?: string };
+    const day = date ? new Date(date) : new Date();
+    const start = new Date(day); start.setHours(0, 0, 0, 0);
+    const end   = new Date(day); end.setHours(23, 59, 59, 999);
+
+    // Splits que liberam neste dia (availableAt no range)
+    const records = await prisma.splitRecord.findMany({
+      where: {
+        availableAt: { gte: start, lte: end },
+        status     : { in: ['PAID', 'PENDING'] },
+      },
+      include: { order: { select: { amountCents: true, paymentMethod: true } } },
+    });
+
+    let platformCents  = 0;
+    let producersCents = 0;
+    let acquirerCents  = 0;
+    for (const r of records) {
+      if (r.recipientType === 'PLATFORM') platformCents  += r.amountCents;
+      else                                producersCents += r.amountCents;
+    }
+    // Estimativa simples de taxa adquirente — 1.1% padrão
+    const grossCents = platformCents + producersCents;
+    acquirerCents = Math.floor(grossCents * 0.011);
+
+    const profitPct = grossCents > 0 ? (platformCents / grossCents) * 100 : 0;
+
+    return reply.send({
+      date           : start.toISOString(),
+      totalCents     : grossCents,
+      acquirerCents,
+      producersCents,
+      platformCents,
+      netCents       : platformCents - acquirerCents,
+      profitPct      : Number(profitPct.toFixed(2)),
+      recordCount    : records.length,
+    });
+  });
+
+  // ─── RECEITAS E TAXAS ────────────────────────────────────────────────────
+  // GET /admin/fees-revenue?period=last_week|month
+  app.get('/fees-revenue', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { period = 'last_week' } = req.query as { period?: string };
+    const end = new Date();
+    const start = new Date();
+    if (period === 'month') start.setMonth(start.getMonth() - 1);
+    else start.setDate(start.getDate() - 7);
+
+    const orders = await prisma.order.findMany({
+      where  : { createdAt: { gte: start, lte: end }, status: 'APPROVED' },
+      include: { offer: { select: { product: { select: { name: true } } } } },
+    });
+
+    const grossCents     = orders.reduce((s, o) => s + o.amountCents, 0);
+    const platformCents  = await prisma.splitRecord.aggregate({
+      where: { recipientType: 'PLATFORM', order: { createdAt: { gte: start, lte: end }, status: 'APPROVED' } },
+      _sum : { amountCents: true },
+    });
+    const withdrawCents  = await prisma.withdrawal.aggregate({
+      where: { createdAt: { gte: start, lte: end }, status: { in: ['PAID', 'PROCESSING'] } },
+      _sum : { amountCents: true },
+    });
+
+    const taxOperationCents = platformCents._sum.amountCents || 0;
+    const acquirerCostCents = Math.floor(grossCents * 0.011);
+    const profitCents       = taxOperationCents - acquirerCostCents;
+
+    // Breakdown por adquirente
+    const byAcquirer = await prisma.order.groupBy({
+      by    : ['acquirer'],
+      where : { createdAt: { gte: start, lte: end }, status: 'APPROVED' },
+      _sum  : { amountCents: true },
+      _count: { _all: true },
+    });
+
+    return reply.send({
+      period,
+      grossCents,
+      withdrawCents       : withdrawCents._sum.amountCents || 0,
+      taxOperationCents,
+      taxInstallmentCents : 0,
+      taxAnticipationCents: 0,
+      taxWithdrawCents    : 0,
+      acquirerCostCents,
+      profitCents,
+      byAcquirer: byAcquirer.map(b => ({
+        acquirer    : b.acquirer || 'unknown',
+        salesCount  : b._count._all,
+        salesCents  : b._sum.amountCents || 0,
+        gatewayFeeCents     : Math.floor((b._sum.amountCents || 0) * 0.05),
+        installmentFeeCents : 0,
+        anticipationFeeCents: 0,
+        acquirerCostCents   : Math.floor((b._sum.amountCents || 0) * 0.011),
+        profitCents         : Math.floor((b._sum.amountCents || 0) * 0.039),
+      })),
+    });
+  });
+
+  // ─── RISCO DE PRODUTOS ───────────────────────────────────────────────────
+  // GET /admin/risk-products
+  app.get('/risk-products', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { search } = req.query as { search?: string };
+    const products = await prisma.product.findMany({
+      where  : {
+        deletedAt: null,
+        ...(search ? { name: { contains: search, mode: 'insensitive' } } : {}),
+        producer: { user: { isActive: true } },
+      },
+      include: {
+        producer: { include: { user: { select: { name: true, email: true, avatarUrl: true } } } },
+        _count  : { select: { offers: true } },
+      },
+      take: 200,
+    });
+
+    // Score básico: status PENDING +5, REJECTED +20, sem categoria +3, sem descrição +2,
+    // até 10 ofertas → +1 cada, > 10 → +5
+    const rows = products.map(p => {
+      let score = 0;
+      if (p.status === 'PENDING')  score += 5;
+      if (p.status === 'REJECTED') score += 20;
+      if (!p.category)             score += 3;
+      if (!p.description)          score += 2;
+      score += Math.min(p._count.offers, 10);
+      return {
+        id        : p.id,
+        name      : p.name,
+        imageUrl  : p.imageUrl,
+        category  : p.category,
+        status    : p.status,
+        riskScore : score,
+        producer  : { name: p.producer.user.name, email: p.producer.user.email, avatarUrl: p.producer.user.avatarUrl },
+        updatedAt : p.updatedAt,
+        createdAt : p.createdAt,
+      };
+    });
+
+    rows.sort((a, b) => b.riskScore - a.riskScore);
+    return reply.send({ rows, maxScore: 28 });
+  });
+
+  // ─── LOGIN COMO PRODUTOR (IMPERSONATION) ─────────────────────────────────
+  // POST /admin/impersonate/:userId — gera tokens do produtor (auditado)
+  app.post('/impersonate/:userId', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const { userId } = req.params as { userId: string };
+    const target = await prisma.user.findUnique({ where: { id: userId } });
+    if (!target) return reply.status(404).send({ message: 'Usuário não encontrado' });
+    if (target.role === 'ADMIN' || target.role === 'STAFF') {
+      return reply.status(403).send({ message: 'Não é permitido se passar por outro admin/staff' });
+    }
+
+    const accessToken  = app.jwt.sign({ sub: target.id, role: target.role, temp: false }, { expiresIn: '15m' });
+    const refreshToken = app.jwt.sign({ sub: target.id, role: target.role, refresh: true }, { expiresIn: '7d' });
+
+    await audit.log({
+      userId : (req.user as any).sub,
+      action : 'ADMIN_IMPERSONATE',
+      level  : 'HIGH',
+      details: { targetUserId: target.id, targetEmail: target.email, targetRole: target.role },
+    });
+    logger.warn({ admin: (req.user as any).sub, target: target.id }, 'Admin: impersonation iniciada');
+
+    return reply.send({ accessToken, refreshToken, user: { id: target.id, name: target.name, email: target.email, role: target.role } });
+  });
 }
