@@ -93,8 +93,18 @@ export async function productRoutes(app: FastifyInstance) {
     const product = await prisma.product.findUnique({
       where: { id, deletedAt: null },
       include: {
-        offers: { where: { isActive: true }, include: { splitRules: { where: { isActive: true } } } },
-        coproducers: { where: { isActive: true }, include: { coproducer: { include: { user: { select: { name: true, email: true } } } } } },
+        offers: {
+          where: { isActive: true },
+          include: {
+            splitRules     : { where: { isActive: true } },
+            affiliateConfig: true,
+            _count         : { select: { affiliateEnrollments: true } },
+          },
+        },
+        coproducers: {
+          where: { isActive: true },
+          include: { coproducer: { include: { user: { select: { name: true, email: true, avatarUrl: true } } } } },
+        },
       },
     });
     if (!product) throw new NotFoundError('Produto');
@@ -106,13 +116,23 @@ export async function productRoutes(app: FastifyInstance) {
     const { id } = req.params as { id: string };
     const body = z.object({
       name             : z.string().optional(),
-      description      : z.string().optional(),
-      imageUrl         : z.string().url().optional(),
-      category         : z.string().optional(),
+      description      : z.string().optional().nullable(),
+      imageUrl         : z.string().url().optional().nullable(),
+      digitalUrl       : z.string().url().optional().nullable(),
+      category         : z.string().optional().nullable(),
       isActive         : z.boolean().optional(),
       successMessage   : z.string().max(20000).optional().nullable(),
       successIcon      : z.string().max(50).optional().nullable(),
       successIconColor : z.string().max(20).optional().nullable(),
+      // Edit rico
+      nameOnInvoice     : z.string().max(10).optional().nullable(),
+      refundDays        : z.number().int().min(7).max(365).optional().nullable(),
+      salesPageUrl      : z.string().url().optional().nullable(),
+      supportEmail      : z.string().email().optional().nullable(),
+      supportPhone      : z.string().max(20).optional().nullable(),
+      membersAreaUrl    : z.string().url().optional().nullable(),
+      affiliateDescription: z.string().max(5000).optional().nullable(),
+      showInMarketplace : z.boolean().optional(),
     }).parse(req.body);
 
     const product = await prisma.product.update({

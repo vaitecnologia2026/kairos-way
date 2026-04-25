@@ -302,6 +302,15 @@ model Product {
   sku          String?
   weightGrams  Int?
   isActive     Boolean       @default(true)
+  // Edit rico (paridade concorrente)
+  nameOnInvoice     String?    @db.VarChar(10)
+  refundDays        Int?       @default(7)
+  salesPageUrl      String?
+  supportEmail      String?
+  supportPhone      String?
+  membersAreaUrl    String?
+  affiliateDescription String?  @db.Text
+  showInMarketplace Boolean    @default(false)
   approvedAt   DateTime?
   approvedBy   String?
   rejectedAt   DateTime?
