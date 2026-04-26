@@ -76,7 +76,7 @@ export async function productRoutes(app: FastifyInstance) {
         where: { status: status || undefined, deletedAt: null },
         include: {
           offers  : { where: { isActive: true }, include: { splitRules: { where: { isActive: true } } } },
-          producer: { include: { user: { select: { name: true, email: true } } } },
+          producer: { include: { user: { select: { name: true, email: true, phone: true, document: true, avatarUrl: true } } } },
         },
         orderBy: { createdAt: 'desc' },
         skip, take: Number(limit),
