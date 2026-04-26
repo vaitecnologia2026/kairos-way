@@ -121,6 +121,15 @@ export async function checkoutRoutes(app: FastifyInstance) {
       billingAddress : z.record(z.string()).optional(),
     }).parse(req.body);
 
+    // Validação de CPF/CNPJ ANTES de chamar Pagar.me — evita erro silencioso (REJECTED com QR vazio)
+    if (body.customerDoc) {
+      const { validateDocument } = await import('../../shared/utils/document');
+      const docError = validateDocument(body.customerDoc);
+      if (docError) {
+        throw new AppError(docError, 422);
+      }
+    }
+
     const offer = await prisma.offer.findUnique({
       where  : { slug, isActive: true, deletedAt: null },
       include: { product: true, splitRules: { where: { isActive: true } } },
