@@ -375,11 +375,13 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       return {
         id           : e.id,
         offerId      : e.offerId,
+        offerSlug    : e.offer.slug,
+        affiliateCode: affiliate.code,
         offerName    : e.offer.name,
         productName  : e.offer.product.name,
         productImage : e.offer.product.imageUrl,
         commissionBps: e.offer.affiliateConfig?.commissionBps || 0,
-        link         : e.link,
+        link         : e.link, // legado — frontend deve usar offerSlug + affiliateCode
         status       : e.status,
         clicks,
         conversions,
