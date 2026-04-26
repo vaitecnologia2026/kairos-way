@@ -940,4 +940,40 @@ export async function adminRoutes(app: FastifyInstance) {
 
     return reply.send({ accessToken, refreshToken, user: { id: target.id, name: target.name, email: target.email, role: target.role } });
   });
+
+  // POST /admin/users/:userId/unlock — destrava conta bloqueada por tentativas inválidas
+  app.post('/users/:userId/unlock', { preHandler: [authenticate, requireRole('ADMIN', 'STAFF')] }, async (req, reply) => {
+    const { userId } = req.params as { userId: string };
+    const user = await prisma.user.findUnique({
+      where : { id: userId },
+      select: { id: true, email: true, name: true, failedAttempts: true, lockedUntil: true },
+    });
+    if (!user) return reply.status(404).send({ message: 'Usuário não encontrado' });
+
+    const wasLocked = !!user.lockedUntil || user.failedAttempts > 0;
+
+    await prisma.user.update({
+      where: { id: userId },
+      data : { failedAttempts: 0, lockedUntil: null },
+    });
+
+    await audit.log({
+      userId : (req.user as any).sub,
+      action : 'ADMIN_UNLOCK_USER',
+      level  : 'MEDIUM',
+      details: {
+        targetUserId : userId,
+        targetEmail  : user.email,
+        wasLocked,
+        previousAttempts: user.failedAttempts,
+        previousLockUntil: user.lockedUntil,
+      },
+    });
+    logger.info({ admin: (req.user as any).sub, target: userId, email: user.email }, 'Admin: conta desbloqueada');
+
+    return reply.send({
+      message: wasLocked ? 'Conta desbloqueada' : 'Conta já estava desbloqueada',
+      wasLocked,
+    });
+  });
 }

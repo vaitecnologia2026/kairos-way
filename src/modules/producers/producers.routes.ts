@@ -558,7 +558,7 @@ export async function producerRoutes(app: FastifyInstance) {
     const [data, total] = await Promise.all([
       prisma.producer.findMany({
         where,
-        include: { user: { select: { name: true, email: true, phone: true } } },
+        include: { user: { select: { id: true, name: true, email: true, phone: true, failedAttempts: true, lockedUntil: true, isActive: true } } },
         orderBy: { createdAt: 'desc' },
         skip, take: Number(limit),
       }),
