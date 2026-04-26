@@ -566,21 +566,38 @@ export async function adminRoutes(app: FastifyInstance) {
               where: { orderId, recipientType: 'AFFILIATE' },
             });
             if (commissionCents > 0 && alreadyHasAffiliateSplit === 0) {
-              const firstRule = await prisma.splitRule.findFirst({
-              where: { offerId: order.offerId!, isActive: true },
-              orderBy: { createdAt: 'asc' },
+              // CRÍTICO: a comissão do afiliado SAI da parte do produtor.
+              // 1) Acha o split do PRODUCER e deduz o commissionCents
+              // 2) Cria o split do AFFILIATE com o valor deduzido
+              const producerRecord = await prisma.splitRecord.findFirst({
+                where: { orderId, recipientType: 'PRODUCER' },
               });
-
-              if (firstRule) await prisma.splitRecord.create({
-                data: {
-                  orderId,
-                  splitRuleId  : firstRule.id,
-                  recipientType: 'AFFILIATE',
-                  recipientId  : affiliate.userId,
-                  amountCents  : commissionCents,
-                  status       : 'PENDING',
-                },
-              });
+              if (!producerRecord) {
+                logger.error({ orderId }, 'test/approve: split do PRODUCER não encontrado — comissão de afiliado abortada');
+              } else {
+                const producerAfterCommission = producerRecord.amountCents - commissionCents;
+                if (producerAfterCommission < 0) {
+                  logger.error(
+                    { orderId, commissionCents, producerCents: producerRecord.amountCents },
+                    'test/approve: comissão excede a parte do produtor — não registrada',
+                  );
+                } else {
+                  await prisma.splitRecord.update({
+                    where: { id: producerRecord.id },
+                    data : { amountCents: producerAfterCommission },
+                  });
+                  await prisma.splitRecord.create({
+                    data: {
+                      orderId,
+                      splitRuleId  : producerRecord.splitRuleId,
+                      recipientType: 'AFFILIATE',
+                      recipientId  : affiliate.userId,
+                      amountCents  : commissionCents,
+                      status       : 'PENDING',
+                    },
+                  });
+                }
+              }
             }
           }
         }
