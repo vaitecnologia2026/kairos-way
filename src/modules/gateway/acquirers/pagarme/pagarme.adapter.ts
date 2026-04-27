@@ -157,25 +157,30 @@ export class PagarmeAdapter implements IAcquirerAdapter {
       customer.name ||
       'CLIENTE';
 
+    // Pagar.me v5: billing_address vai DENTRO de payment.credit_card.card
+    // Doc: https://docs.pagar.me/reference/criar-pedido-1
+    const billingAddress = {
+      line_1  : line1,
+      zip_code: (raw.zipCode || raw.zip_code || '01310100').toString().replace(/\D/g, ''),
+      city    : raw.city  || 'Sao Paulo',
+      state   : (raw.state || 'SP').toUpperCase(),
+      country : raw.country || 'BR',
+      ...(raw.complement || raw.line_2 ? { line_2: raw.complement || raw.line_2 } : {}),
+    };
+
     const payload = {
       amount  : input.amountCents,
       customer,
       payment : {
         payment_method: 'credit_card',
         credit_card   : {
+          operation_type      : 'auth_and_capture',
           installments,
           statement_descriptor: 'KAIROSWAY',
-          card                : { token: input.cardToken },
-          billing             : {
-            name   : String(billingName).slice(0, 64),
-            address: {
-              line_1  : line1,
-              zip_code: (raw.zipCode || raw.zip_code || '01310100').toString().replace(/\D/g, ''),
-              city    : raw.city  || 'Sao Paulo',
-              state   : (raw.state || 'SP').toUpperCase(),
-              country : raw.country || 'BR',
-              ...(raw.complement || raw.line_2 ? { line_2: raw.complement || raw.line_2 } : {}),
-            },
+          card                : {
+            token         : input.cardToken,
+            holder_name   : String(billingName).slice(0, 64),
+            billing_address: billingAddress,
           },
         },
       },
