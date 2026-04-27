@@ -96,6 +96,26 @@ export async function offerRoutes(app: FastifyInstance) {
     return reply.send(offer);
   });
 
+  // DELETE /offers/:id — soft delete (preserva histórico de pedidos)
+  app.delete('/:id', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE')] }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+
+    const offer = await prisma.offer.findUnique({ where: { id }, include: { product: true } });
+    if (!offer) throw new NotFoundError('Oferta');
+
+    if (req.user.role === 'PRODUCER' || req.user.role === 'AFFILIATE') {
+      const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
+      if (offer.product.producerId !== producer?.id) throw new ForbiddenError();
+    }
+
+    await prisma.offer.update({
+      where: { id },
+      data : { isActive: false, deletedAt: new Date() },
+    });
+
+    return reply.send({ message: 'Oferta removida' });
+  });
+
   // POST /offers/:id/splits — configurar splits de uma oferta
   app.post('/:id/splits', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN', 'AFFILIATE'), requireProducerApproved] }, async (req, reply) => {
     const { id } = req.params as { id: string };
