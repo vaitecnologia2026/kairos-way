@@ -3,6 +3,7 @@ import { z }                                         from 'zod';
 import { authenticate, requireRole }                 from '../../shared/middleware/auth.middleware';
 import { prisma }                                    from '../../shared/utils/prisma';
 import { AuditService }                              from '../audit/audit.service';
+import { AppError, NotFoundError }                   from '../../shared/errors/AppError';
 import { createId }                                  from '@paralleldrive/cuid2';
 import bcrypt                                          from 'bcryptjs';
 import { logger }                                    from '../../shared/utils/logger';
@@ -226,6 +227,49 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     }
 
     return reply.send({ message: 'Afiliado rejeitado.' });
+  });
+
+  // DELETE /affiliates/:id — exclui afiliado (User + cascade) — somente ADMIN
+  app.delete('/:id', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const aff = await prisma.affiliate.findUnique({ where: { id }, include: { user: true } });
+    if (!aff) throw new NotFoundError('Afiliado');
+
+    const [enrollmentCount, trackingCount] = await Promise.all([
+      prisma.affiliateEnrollment.count({ where: { affiliateId: id } }),
+      prisma.affiliateTracking.count({ where: { affiliateId: id } }),
+    ]);
+    if (enrollmentCount > 0 || trackingCount > 0) {
+      throw new AppError(
+        `Não é possível excluir: afiliado possui ${enrollmentCount} inscrição(ões) e ${trackingCount} rastreamento(s) no histórico.`,
+        409,
+      );
+    }
+
+    const userId = aff.userId;
+    const userEmail = aff.user.email;
+
+    const withdrawalCount = await prisma.withdrawal.count({ where: { userId } });
+    if (withdrawalCount > 0) {
+      throw new AppError(`Não é possível excluir: afiliado possui ${withdrawalCount} saque(s) no histórico.`, 409);
+    }
+
+    await prisma.$transaction([
+      prisma.notification.deleteMany({ where: { userId } }),
+      prisma.pushToken.deleteMany({ where: { userId } }),
+      prisma.userIntegration.deleteMany({ where: { userId } }),
+      prisma.webhookEndpoint.deleteMany({ where: { userId } }),
+      prisma.coproducerRequest.deleteMany({ where: { userId } }),
+      prisma.auditLog.updateMany({ where: { userId }, data: { userId: null } }),
+      prisma.user.delete({ where: { id: userId } }),
+    ]);
+
+    await audit.log({
+      userId : req.user.sub, action: 'AFFILIATE_DELETED',
+      details: { affiliateId: id, userId, email: userEmail }, level: 'HIGH',
+    });
+
+    return reply.send({ message: 'Afiliado e dados vinculados excluídos' });
   });
 
   // ─── ROTAS DO AFILIADO ────────────────────────────────────────────────────

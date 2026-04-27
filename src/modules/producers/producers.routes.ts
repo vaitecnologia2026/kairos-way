@@ -714,7 +714,7 @@ export async function producerRoutes(app: FastifyInstance) {
 
     const producer = await prisma.producer.update({
       where  : { id },
-      data   : { kycStatus: 'REJECTED', rejectedAt: new Date(), rejectedBy: req.user.sub, rejectedReason: body.reason },
+      data   : { kycStatus: 'REJECTED', isActive: false, rejectedAt: new Date(), rejectedBy: req.user.sub, rejectedReason: body.reason },
       include: { user: true },
     });
 
@@ -725,7 +725,13 @@ export async function producerRoutes(app: FastifyInstance) {
       level   : 'HIGH',
     });
 
-    // Notificar produtor da rejeição com motivo
+    await notifications.notify({
+      recipient: { kind: 'user', userId: producer.userId },
+      type     : NotifType.KYC_REVOKED,
+      title    : 'Cadastro recusado',
+      body     : `Seu cadastro como produtor foi recusado: ${body.reason}`,
+    });
+
     await enqueueEmail(
       producer.user.email,
       'Atualização sobre sua conta Kairos Way',
@@ -737,6 +743,49 @@ export async function producerRoutes(app: FastifyInstance) {
     );
 
     return reply.send({ message: 'Produtor rejeitado' });
+  });
+
+  // ── DELETE /producers/:id ─────────────────────────────────────
+  // Apaga User+Producer+Affiliate+KycDocs (cascade). Bloqueia se houver pedidos/produtos.
+  app.delete('/:id', {
+    preHandler: [authenticate, requireRole('ADMIN')],
+  }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const producer = await prisma.producer.findUnique({ where: { id }, include: { user: true } });
+    if (!producer) throw new NotFoundError('Produtor');
+
+    const userId = producer.userId;
+    const userEmail = producer.user.email;
+
+    const [productCount, withdrawalCount] = await Promise.all([
+      prisma.product.count({ where: { producerId: id } }),
+      prisma.withdrawal.count({ where: { userId } }),
+    ]);
+    if (productCount > 0 || withdrawalCount > 0) {
+      throw new AppError(
+        `Não é possível excluir: produtor possui ${productCount} produto(s) e ${withdrawalCount} saque(s) no histórico.`,
+        409,
+      );
+    }
+
+    await prisma.$transaction([
+      prisma.notification.deleteMany({ where: { userId } }),
+      prisma.pushToken.deleteMany({ where: { userId } }),
+      prisma.userIntegration.deleteMany({ where: { userId } }),
+      prisma.webhookEndpoint.deleteMany({ where: { userId } }),
+      prisma.coproducerRequest.deleteMany({ where: { userId } }),
+      prisma.auditLog.updateMany({ where: { userId }, data: { userId: null } }),
+      prisma.user.delete({ where: { id: userId } }),
+    ]);
+
+    await auditService.log({
+      userId : req.user.sub,
+      action : 'PRODUCER_DELETED',
+      details: { producerId: id, userId, email: userEmail },
+      level  : 'HIGH',
+    });
+
+    return reply.send({ message: 'Produtor e dados vinculados excluídos' });
   });
 
   // ── POST /producers/:id/block ─────────────────────────────────
