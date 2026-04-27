@@ -84,6 +84,10 @@ export async function membersAreaRoutes(app: FastifyInstance) {
       description    : z.string().optional().nullable(),
       coverUrl       : z.string().url().optional().nullable(),
       commentsEnabled: z.boolean().optional(),
+      primaryColor   : z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().nullable(),
+      accentColor    : z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().nullable(),
+      theme          : z.enum(['dark', 'light']).optional(),
+      layout         : z.enum(['sidebar', 'stacked']).optional(),
     }).parse(req.body);
 
     const existing = await prisma.membersArea.findUnique({ where: { productId } });
@@ -113,6 +117,10 @@ export async function membersAreaRoutes(app: FastifyInstance) {
       description    : z.string().optional().nullable(),
       coverUrl       : z.string().url().optional().nullable(),
       commentsEnabled: z.boolean().optional(),
+      primaryColor   : z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().nullable(),
+      accentColor    : z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().nullable(),
+      theme          : z.enum(['dark', 'light']).optional(),
+      layout         : z.enum(['sidebar', 'stacked']).optional(),
     }).parse(req.body);
 
     const updated = await prisma.membersArea.update({ where: { id }, data: body });

@@ -345,6 +345,11 @@ model MembersArea {
   description     String?  @db.Text
   coverUrl        String?
   commentsEnabled Boolean  @default(true)
+  // Personalização do curso (visual do cliente)
+  primaryColor    String?  // hex (ex: "#7c3aed") — cor de destaque do curso
+  accentColor     String?  // hex — cor secundária (links, badges)
+  theme           String?  @default("dark") // "dark" | "light"
+  layout          String?  @default("sidebar") // "sidebar" | "stacked"
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
