@@ -941,7 +941,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
 
     const offer = await prisma.offer.findFirst({
       where : { slug: offerSlug, isActive: true, deletedAt: null },
-      select: { id: true, slug: true, product: { select: { status: true, deletedAt: true } } },
+      select: { id: true, slug: true, product: { select: { status: true, deletedAt: true, producerId: true } } },
     });
     if (!offer || offer.product.deletedAt || offer.product.status !== 'APPROVED') {
       return reply.status(404).send({ message: 'Oferta não encontrada' });
@@ -955,6 +955,11 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     const splitCount = await prisma.splitRule.count({ where: { offerId: offer.id, isActive: true } });
     if (splitCount === 0) {
       return reply.status(422).send({ message: 'Oferta ainda não tem splits configurados.' });
+    }
+
+    const myProducer = await prisma.producer.findUnique({ where: { userId: req.user.sub }, select: { id: true } });
+    if (myProducer && offer.product.producerId === myProducer.id) {
+      return reply.status(422).send({ message: 'Você não pode se afiliar a uma oferta do seu próprio produto.' });
     }
 
     let affiliate = await prisma.affiliate.findUnique({ where: { userId: req.user.sub } });
