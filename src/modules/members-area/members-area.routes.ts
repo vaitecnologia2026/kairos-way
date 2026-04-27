@@ -74,6 +74,11 @@ export async function membersAreaRoutes(app: FastifyInstance) {
     const { productId } = req.params as { productId: string };
     await assertProductOwner(productId, req.user.sub, req.user.role);
 
+    const product = await prisma.product.findUnique({ where: { id: productId }, select: { type: true } });
+    if (product?.type !== 'DIGITAL') {
+      throw new AppError('Área de membros só pode ser criada em produtos do tipo Digital.', 422);
+    }
+
     const body = z.object({
       title          : z.string().min(2),
       description    : z.string().optional().nullable(),
@@ -178,7 +183,7 @@ export async function membersAreaRoutes(app: FastifyInstance) {
       description  : z.string().optional().nullable(),
       coverUrl     : z.string().url().optional().nullable(),
       videoUrl     : z.string().url().optional().nullable(),
-      videoSource  : z.enum(['YOUTUBE', 'VIMEO', 'MP4_DIRECT']).optional().nullable(),
+      videoSource  : z.enum(['YOUTUBE', 'MP4_DIRECT', 'OTHER']).optional().nullable(),
       hideVideo    : z.boolean().optional(),
       defaultPlayer: z.boolean().optional(),
     }).parse(req.body);
@@ -200,7 +205,7 @@ export async function membersAreaRoutes(app: FastifyInstance) {
       description  : z.string().optional().nullable(),
       coverUrl     : z.string().url().optional().nullable(),
       videoUrl     : z.string().url().optional().nullable(),
-      videoSource  : z.enum(['YOUTUBE', 'VIMEO', 'MP4_DIRECT']).optional().nullable(),
+      videoSource  : z.enum(['YOUTUBE', 'MP4_DIRECT', 'OTHER']).optional().nullable(),
       hideVideo    : z.boolean().optional(),
       defaultPlayer: z.boolean().optional(),
       position     : z.number().int().min(0).optional(),
