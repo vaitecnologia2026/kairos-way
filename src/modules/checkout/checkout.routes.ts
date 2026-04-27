@@ -117,6 +117,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
       customerPhone  : z.string().optional(),
       method         : z.enum(['PIX', 'CREDIT_CARD', 'BOLETO']),
       cardToken      : z.string().optional(),
+      cardHolder     : z.string().optional(),
       installments   : z.number().int().min(1).max(12).optional(),
       billingAddress : z.record(z.string()).optional(),
     }).parse(req.body);
@@ -206,10 +207,11 @@ export async function checkoutRoutes(app: FastifyInstance) {
         customerDoc   : body.customerDoc,
         customerPhone : body.customerPhone,   // FIX: obrigatório para PIX
         cardToken     : body.cardToken,
+        cardHolder    : body.cardHolder,      // FIX: vira billing.name no Pagar.me
         billingAddress: body.billingAddress,  // FIX: obrigatório para Boleto
         productName   : offer.product.name,   // description para Pluga/NFe.io
         ip            : req.ip,
-      });
+      } as any);
 
       const orderStatus = result.status === 'APPROVED'
         ? 'APPROVED'

@@ -143,6 +143,20 @@ export class PagarmeAdapter implements IAcquirerAdapter {
 
     const installments = input.installments || 1;
 
+    // billing é OBRIGATÓRIO no payload Pagar.me (name + address.line_1/zip/city/state/country).
+    // Frontend envia { street, number, complement, neighborhood, city, state, zipCode, country }.
+    // Doc: https://docs.pagar.me/reference/cartão-de-crédito-1
+    const raw  = (input.billingAddress as Record<string, any>) || {};
+    const line1 = [raw.number, raw.street, raw.neighborhood].filter(Boolean).join(', ')
+      || raw.line_1
+      || '000, Rua';
+    const billingName =
+      (input as any).cardHolder ||
+      raw.name ||
+      input.customerName ||
+      customer.name ||
+      'CLIENTE';
+
     const payload = {
       amount  : input.amountCents,
       customer,
@@ -153,12 +167,14 @@ export class PagarmeAdapter implements IAcquirerAdapter {
           statement_descriptor: 'KAIROSWAY',
           card                : { token: input.cardToken },
           billing             : {
+            name   : String(billingName).slice(0, 64),
             address: {
-              line_1  : (input.billingAddress as any)?.line_1   || '000, Street',
-              zip_code: (input.billingAddress as any)?.zip_code || '01310100',
-              city    : (input.billingAddress as any)?.city     || 'Sao Paulo',
-              state   : (input.billingAddress as any)?.state    || 'SP',
-              country : (input.billingAddress as any)?.country  || 'BR',
+              line_1  : line1,
+              zip_code: (raw.zipCode || raw.zip_code || '01310100').toString().replace(/\D/g, ''),
+              city    : raw.city  || 'Sao Paulo',
+              state   : (raw.state || 'SP').toUpperCase(),
+              country : raw.country || 'BR',
+              ...(raw.complement || raw.line_2 ? { line_2: raw.complement || raw.line_2 } : {}),
             },
           },
         },
