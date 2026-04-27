@@ -18,7 +18,13 @@ export async function offerRoutes(app: FastifyInstance) {
       description: z.string().optional(),
       priceCents: z.number().int().positive(),
       type: z.enum(['STANDARD', 'UPSELL', 'ORDERBUMP', 'SUBSCRIPTION']).default('STANDARD'),
+      subscriptionCycle : z.enum(['WEEKLY','BIWEEKLY','MONTHLY','QUARTERLY','SEMIANNUAL','ANNUAL']).optional(),
+      subscriptionMonths: z.number().int().min(1).optional(),
     }).parse(req.body);
+
+    if (body.type === 'SUBSCRIPTION' && !body.subscriptionCycle) {
+      return reply.status(422).send({ message: 'Defina a frequência de cobrança (subscriptionCycle) para ofertas de assinatura.' });
+    }
 
     // Verificar propriedade do produto
     const product = await prisma.product.findUnique({ where: { id: body.productId } });
@@ -90,6 +96,8 @@ export async function offerRoutes(app: FastifyInstance) {
       description: z.string().optional(),
       priceCents: z.number().int().positive().optional(),
       isActive: z.boolean().optional(),
+      subscriptionCycle : z.enum(['WEEKLY','BIWEEKLY','MONTHLY','QUARTERLY','SEMIANNUAL','ANNUAL']).optional().nullable(),
+      subscriptionMonths: z.number().int().min(1).optional().nullable(),
     }).parse(req.body);
 
     const offer = await prisma.offer.update({ where: { id }, data: body });

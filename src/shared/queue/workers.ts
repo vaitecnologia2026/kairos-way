@@ -233,6 +233,18 @@ function startDunningWorker(): Worker {
     const sub = await prisma.subscription.findUnique({ where: { id: subscriptionId } });
     if (!sub || sub.status !== 'ACTIVE') return;
 
+    // Plano com duração definida — encerra automaticamente quando atinge o fim
+    const reachedEnd = sub.endsAt && new Date() >= sub.endsAt;
+    const reachedCap = sub.totalCharges && sub.chargesMade >= sub.totalCharges;
+    if (reachedEnd || reachedCap) {
+      await prisma.subscription.update({
+        where: { id: subscriptionId },
+        data : { status: 'CANCELLED', cancelledAt: new Date(), cancelReason: 'Plano concluído (duração contratada atingida)' },
+      });
+      logger.info({ subscriptionId, reachedEnd, reachedCap }, 'Assinatura concluída por duração');
+      return;
+    }
+
     if (sub.retryCount >= 3) {
       await prisma.subscription.update({
         where: { id: subscriptionId },
@@ -265,12 +277,16 @@ function startDunningWorker(): Worker {
       });
 
       const nextChargeAt = calcNextCharge(sub.cycle);
+      const newChargesMade = (sub.chargesMade || 0) + 1;
+      const finished = sub.totalCharges && newChargesMade >= sub.totalCharges;
       await prisma.subscription.update({
         where: { id: subscriptionId },
-        data : { retryCount: 0, lastChargedAt: new Date(), nextChargeAt },
+        data : finished
+          ? { retryCount: 0, lastChargedAt: new Date(), chargesMade: newChargesMade, status: 'CANCELLED', cancelledAt: new Date(), cancelReason: 'Plano concluído (todas as cobranças realizadas)' }
+          : { retryCount: 0, lastChargedAt: new Date(), chargesMade: newChargesMade, nextChargeAt },
       });
 
-      logger.info({ subscriptionId }, 'Dunning: cobrança bem-sucedida');
+      logger.info({ subscriptionId, chargesMade: newChargesMade, finished }, 'Dunning: cobrança bem-sucedida');
 
     } catch {
       const retryDelays = [24, 48, 72];

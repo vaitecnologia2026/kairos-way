@@ -10,6 +10,16 @@ import { notifications, NotifType } from '../../shared/notifications/notificatio
 
 const auditService = new AuditService();
 
+// Garante um Producer record para o User fazer KYC.
+// Afiliados podem completar KYC para virar recebedor Pagar.me e operar como produtor depois.
+async function ensureProducerForKyc(userId: string) {
+  const existing = await prisma.producer.findUnique({ where: { userId } });
+  if (existing) return existing;
+  return prisma.producer.create({
+    data: { userId, kycStatus: 'PENDING', isActive: false },
+  });
+}
+
 export async function producerRoutes(app: FastifyInstance) {
 
   // ── GET /producers/me ─────────────────────────────────────────
@@ -26,15 +36,14 @@ export async function producerRoutes(app: FastifyInstance) {
 
   // ── POST /producers/kyc/documents ─────────────────────────────
   app.post('/kyc/documents', {
-    preHandler: [authenticate, requireRole('PRODUCER')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')],
   }, async (req, reply) => {
     const body = z.object({
       type: z.string().min(2),
       url : z.string().url(),
     }).parse(req.body);
 
-    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
-    if (!producer) throw new NotFoundError('Produtor');
+    const producer = await ensureProducerForKyc(req.user.sub);
 
     const doc = await prisma.kycDocument.create({
       data: { producerId: producer.id, type: body.type, url: body.url },
@@ -57,8 +66,9 @@ export async function producerRoutes(app: FastifyInstance) {
 
   // ── GET /producers/kyc/status ─────────────────────────────────
   app.get('/kyc/status', {
-    preHandler: [authenticate, requireRole('PRODUCER')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')],
   }, async (req, reply) => {
+    await ensureProducerForKyc(req.user.sub);
     const producer = await prisma.producer.findUnique({
       where  : { userId: req.user.sub },
       include: { kycDocuments: true },
@@ -86,7 +96,7 @@ export async function producerRoutes(app: FastifyInstance) {
 
   // ── PATCH /producers/banking — produtor informa dados bancários ──
   app.patch('/banking', {
-    preHandler: [authenticate, requireRole('PRODUCER')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')],
   }, async (req, reply) => {
     const body = z.object({
       bank              : z.string().min(3).max(3), // código ISPB de 3 dígitos
@@ -99,9 +109,8 @@ export async function producerRoutes(app: FastifyInstance) {
       holderDocument    : z.string().transform(v => v.replace(/\D/g, '')).refine(v => v.length === 11 || v.length === 14, { message: 'CPF (11) ou CNPJ (14)' }),
     }).parse(req.body);
 
-    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
-    if (!producer) throw new NotFoundError('Produtor');
-    if (producer.kycStatus === 'APPROVED' && producer.pagarmeRecipientId) throw new AppError('Produtor já aprovado — dados bancários bloqueados', 400);
+    const producer = await ensureProducerForKyc(req.user.sub);
+    if (producer.kycStatus === 'APPROVED' && producer.pagarmeRecipientId) throw new AppError('Cadastro já aprovado — dados bancários bloqueados', 400);
 
     await prisma.producer.update({
       where: { id: producer.id },
@@ -114,7 +123,7 @@ export async function producerRoutes(app: FastifyInstance) {
 
   // ── PATCH /producers/register-information — produtor completa KYC ──
   app.patch('/register-information', {
-    preHandler: [authenticate, requireRole('PRODUCER')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')],
   }, async (req, reply) => {
     const addressSchema = z.object({
       street        : z.string().min(2),
@@ -157,9 +166,8 @@ export async function producerRoutes(app: FastifyInstance) {
       managingPartners: z.array(z.any()).optional(),
     }).parse(req.body);
 
-    const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub } });
-    if (!producer) throw new NotFoundError('Produtor');
-    if (producer.kycStatus === 'APPROVED' && producer.pagarmeRecipientId) throw new AppError('Produtor já aprovado — dados bloqueados', 400);
+    const producer = await ensureProducerForKyc(req.user.sub);
+    if (producer.kycStatus === 'APPROVED' && producer.pagarmeRecipientId) throw new AppError('Cadastro já aprovado — dados bloqueados', 400);
 
     const currentMeta = (producer.metadata as any) || {};
     await prisma.producer.update({
@@ -173,8 +181,9 @@ export async function producerRoutes(app: FastifyInstance) {
 
   // ── POST /producers/kyc/submit — finaliza envio e marca DOCUMENTS_SENT ──
   app.post('/kyc/submit', {
-    preHandler: [authenticate, requireRole('PRODUCER')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')],
   }, async (req, reply) => {
+    await ensureProducerForKyc(req.user.sub);
     const producer = await prisma.producer.findUnique({
       where  : { userId: req.user.sub },
       include: { kycDocuments: true },

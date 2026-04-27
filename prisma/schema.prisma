@@ -414,6 +414,9 @@ model Offer {
   priceCents   Int
   type         OfferType @default(STANDARD)
   isActive     Boolean   @default(true)
+  // Para type = SUBSCRIPTION
+  subscriptionCycle  SubCycle?  // frequência da cobrança (MONTHLY, ANNUAL, etc.)
+  subscriptionMonths Int?       // duração total em meses (null = sem fim definido / até cancelar)
   metadata     Json?
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
@@ -542,6 +545,9 @@ model Subscription {
   cycle           SubCycle
   priceCents      Int
   nextChargeAt    DateTime
+  endsAt          DateTime?     // se preenchido, assinatura termina nessa data (não cobra mais)
+  totalCharges    Int?          // nº total de cobranças previstas (snapshot de Offer.subscriptionMonths)
+  chargesMade     Int           @default(0)
   retryCount      Int           @default(0)
   lastChargedAt   DateTime?
   lastFailAt      DateTime?
