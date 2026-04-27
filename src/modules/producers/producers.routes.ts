@@ -24,8 +24,9 @@ export async function producerRoutes(app: FastifyInstance) {
 
   // ── GET /producers/me ─────────────────────────────────────────
   app.get('/me', {
-    preHandler: [authenticate, requireRole('PRODUCER')],
+    preHandler: [authenticate, requireRole('PRODUCER', 'AFFILIATE')],
   }, async (req, reply) => {
+    await ensureProducerForKyc(req.user.sub);
     const producer = await prisma.producer.findUnique({
       where  : { userId: req.user.sub },
       include: { user: { select: { name: true, email: true, phone: true, document: true } } },
