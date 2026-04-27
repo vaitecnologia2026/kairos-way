@@ -393,12 +393,14 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     const affiliate = await prisma.affiliate.findUnique({ where: { userId: req.user.sub } });
     if (!affiliate) return reply.send([]);
 
+    const myProducer = await prisma.producer.findUnique({ where: { userId: req.user.sub }, select: { id: true } });
+
     const enrollments = await prisma.affiliateEnrollment.findMany({
       where  : { affiliateId: affiliate.id },
       include: {
         offer: {
           include: {
-            product        : { select: { name: true, imageUrl: true, status: true, deletedAt: true } },
+            product        : { select: { name: true, imageUrl: true, status: true, deletedAt: true, producerId: true } },
             affiliateConfig: { select: { commissionBps: true } },
             splitRules     : { where: { isActive: true }, select: { basisPoints: true } },
           },
@@ -409,7 +411,9 @@ export async function affiliatesRoutes(app: FastifyInstance) {
 
     // Filtra inscrições cujo produto/oferta deixou de ser vendável
     // (evita mostrar link que retorna 404 no checkout)
+    // Também esconde self-enrolls legados (produto pertence ao próprio usuário)
     const sellable = enrollments.filter(e => {
+      if (myProducer && e.offer.product.producerId === myProducer.id) return false;
       if (!e.offer.isActive || e.offer.deletedAt) return false;
       if (e.offer.product.status !== 'APPROVED' || e.offer.product.deletedAt) return false;
       const total = e.offer.splitRules.reduce((s, r) => s + r.basisPoints, 0);
