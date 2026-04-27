@@ -282,6 +282,8 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     // - Produto APROVADO (não PENDING/REJECTED)
     // - Oferta ativa + affiliateConfig habilitado
     // - splitRules ativos (checamos a soma = 10000 bps depois no JS)
+    // - Para PRODUCER, esconde produtos próprios (não faz sentido afiliar a si mesmo)
+    const myProducer = await prisma.producer.findUnique({ where: { userId: req.user.sub }, select: { id: true } });
     const configs = await prisma.affiliateConfig.findMany({
       where  : {
         enabled: true,
@@ -289,7 +291,9 @@ export async function affiliatesRoutes(app: FastifyInstance) {
           isActive  : true,
           deletedAt : null,
           splitRules: { some: { isActive: true } },
-          product   : { status: 'APPROVED', deletedAt: null },
+          product   : myProducer
+            ? { status: 'APPROVED', deletedAt: null, producerId: { not: myProducer.id } }
+            : { status: 'APPROVED', deletedAt: null },
         },
       },
       include: {
@@ -346,6 +350,13 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       return reply.status(422).send({
         message: 'Oferta ainda não tem splits configurados. Aguarde o produtor completar a configuração antes de se afiliar.',
       });
+    }
+
+    // Bloqueia produtor de se afiliar ao próprio produto
+    const offerProduct = await prisma.offer.findUnique({ where: { id: offerId }, select: { product: { select: { producerId: true } } } });
+    const myProducer = await prisma.producer.findUnique({ where: { userId: req.user.sub }, select: { id: true } });
+    if (myProducer && offerProduct?.product.producerId === myProducer.id) {
+      return reply.status(422).send({ message: 'Você não pode se afiliar a uma oferta do seu próprio produto.' });
     }
 
     // Criar perfil de afiliado se não existir
