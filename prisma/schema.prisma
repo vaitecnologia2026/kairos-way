@@ -182,6 +182,7 @@ model User {
   pushTokens    PushToken[]
   notifications Notification[]
   passwordResets PasswordResetCode[]
+  lessonComments LessonComment[]
 
   @@index([email])
   @@index([role])
@@ -326,10 +327,82 @@ model Product {
   producer     Producer             @relation(fields: [producerId], references: [id])
   offers       Offer[]
   coproducers  CoproducerProduct[]
+  membersArea  MembersArea?
 
   @@index([producerId])
   @@index([status])
   @@index([type])
+}
+
+// ══════════════════════════════════════════════════════
+// MEMBERS AREA (curso online)
+// ══════════════════════════════════════════════════════
+
+model MembersArea {
+  id              String   @id @default(cuid())
+  productId       String   @unique
+  title           String
+  description     String?  @db.Text
+  coverUrl        String?
+  commentsEnabled Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  product Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  modules Module[]
+}
+
+model Module {
+  id                String   @id @default(cuid())
+  membersAreaId     String
+  title             String
+  description       String?  @db.Text
+  coverUrl          String?
+  releaseAfterDays  Int      @default(0)
+  visible           Boolean  @default(true)
+  showPublishDate   Boolean  @default(true)
+  showModuleTitle   Boolean  @default(true)
+  position          Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  membersArea MembersArea @relation(fields: [membersAreaId], references: [id], onDelete: Cascade)
+  lessons     Lesson[]
+
+  @@index([membersAreaId])
+}
+
+model Lesson {
+  id            String   @id @default(cuid())
+  moduleId      String
+  title         String
+  description   String?  @db.Text
+  coverUrl      String?
+  videoUrl      String?
+  videoSource   String?  // YOUTUBE | VIMEO | MP4_DIRECT
+  hideVideo     Boolean  @default(false)
+  defaultPlayer Boolean  @default(false)
+  position      Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  module   Module          @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  comments LessonComment[]
+
+  @@index([moduleId])
+}
+
+model LessonComment {
+  id        String   @id @default(cuid())
+  lessonId  String
+  userId    String
+  content   String   @db.Text
+  createdAt DateTime @default(now())
+
+  lesson Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([lessonId])
 }
 
 model Offer {

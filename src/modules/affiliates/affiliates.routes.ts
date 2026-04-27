@@ -125,12 +125,72 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     const enrollments = await prisma.affiliateEnrollment.findMany({
       where  : { offerId },
       include: {
-        affiliate: { include: { user: { select: { name: true, email: true } } } },
+        affiliate: { include: { user: { select: { name: true, email: true, phone: true } } } },
       },
       orderBy: { createdAt: 'desc' },
     });
 
     return reply.send(enrollments);
+  });
+
+  // POST /affiliates/products/:productId/affiliates/:affiliateId/block
+  // Produtor remove um afiliado de TODAS as ofertas de um produto seu de uma vez.
+  app.post('/products/:productId/affiliates/:affiliateId/block', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+    const { productId, affiliateId } = req.params as { productId: string; affiliateId: string };
+
+    const product = await prisma.product.findUnique({ where: { id: productId }, select: { producerId: true } });
+    if (!product) return reply.status(404).send({ message: 'Produto não encontrado' });
+
+    if (req.user.role === 'PRODUCER') {
+      const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub }, select: { id: true } });
+      if (product.producerId !== producer?.id) {
+        return reply.status(403).send({ message: 'Você não é dono deste produto' });
+      }
+    }
+
+    const result = await prisma.affiliateEnrollment.updateMany({
+      where: { affiliateId, offer: { productId } },
+      data : { status: 'BLOCKED' },
+    });
+
+    await audit.log({
+      userId : req.user.sub, action: 'AFFILIATE_PRODUCT_BLOCKED',
+      details: { productId, affiliateId, count: result.count },
+      level  : 'MEDIUM',
+    });
+
+    return reply.send({ message: 'Afiliado removido', count: result.count });
+  });
+
+  // POST /affiliates/enrollments/:id/block — variante por enrollment específico (usada pelo admin)
+  app.post('/enrollments/:id/block', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+
+    const enrollment = await prisma.affiliateEnrollment.findUnique({
+      where  : { id },
+      include: { offer: { select: { product: { select: { producerId: true } } } } },
+    });
+    if (!enrollment) return reply.status(404).send({ message: 'Inscrição não encontrada' });
+
+    if (req.user.role === 'PRODUCER') {
+      const producer = await prisma.producer.findUnique({ where: { userId: req.user.sub }, select: { id: true } });
+      if (enrollment.offer.product.producerId !== producer?.id) {
+        return reply.status(403).send({ message: 'Você não é dono desta oferta' });
+      }
+    }
+
+    const updated = await prisma.affiliateEnrollment.update({
+      where: { id },
+      data : { status: 'BLOCKED' },
+    });
+
+    await audit.log({
+      userId : req.user.sub, action: 'AFFILIATE_ENROLLMENT_BLOCKED',
+      details: { enrollmentId: id, offerId: enrollment.offerId, affiliateId: enrollment.affiliateId },
+      level  : 'MEDIUM',
+    });
+
+    return reply.send(updated);
   });
 
   // GET /affiliates/pending — afiliados (filtra por status)
@@ -292,8 +352,8 @@ export async function affiliatesRoutes(app: FastifyInstance) {
           deletedAt : null,
           splitRules: { some: { isActive: true } },
           product   : myProducer
-            ? { status: 'APPROVED', deletedAt: null, producerId: { not: myProducer.id } }
-            : { status: 'APPROVED', deletedAt: null },
+            ? { status: 'APPROVED', deletedAt: null, showInMarketplace: true, producerId: { not: myProducer.id } }
+            : { status: 'APPROVED', deletedAt: null, showInMarketplace: true },
         },
       },
       include: {
@@ -337,7 +397,66 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     })));
   });
 
-  // POST /affiliates/enroll — se inscrever em uma oferta
+  // Helper: inscreve afiliado em todas as ofertas válidas de um produto.
+  // - Pula ofertas com enrollment BLOCKED (preserva bloqueio do produtor).
+  // - Mantém enrollments já ACTIVE existentes.
+  // Retorna { primary, allEnrollments } onde primary é o enrollment da oferta solicitada.
+  async function enrollAffiliateInAllProductOffers(
+    affiliateId: string,
+    affiliateCode: string,
+    primaryOfferId: string,
+  ) {
+    const primaryOffer = await prisma.offer.findUnique({
+      where : { id: primaryOfferId },
+      select: { productId: true },
+    });
+    if (!primaryOffer) return null;
+
+    const candidateOffers = await prisma.offer.findMany({
+      where: {
+        productId      : primaryOffer.productId,
+        isActive       : true,
+        deletedAt      : null,
+        affiliateConfig: { enabled: true },
+        splitRules     : { some: { isActive: true } },
+      },
+      select: { id: true, slug: true, splitRules: { where: { isActive: true }, select: { basisPoints: true } } },
+    });
+
+    const validOffers = candidateOffers.filter(o => {
+      const total = o.splitRules.reduce((s, r) => s + r.basisPoints, 0);
+      return total === 10000;
+    });
+
+    const existing = await prisma.affiliateEnrollment.findMany({
+      where  : { affiliateId, offerId: { in: validOffers.map(o => o.id) } },
+      select : { offerId: true, status: true, id: true },
+    });
+    const existingMap = new Map(existing.map(e => [e.offerId, e]));
+
+    const created: Array<{ offerId: string; created: boolean; enrollmentId: string; status: string }> = [];
+
+    for (const o of validOffers) {
+      const existingEnr = existingMap.get(o.id);
+      if (existingEnr) {
+        created.push({ offerId: o.id, created: false, enrollmentId: existingEnr.id, status: existingEnr.status });
+        continue;
+      }
+      const enr = await prisma.affiliateEnrollment.create({
+        data: {
+          affiliateId,
+          offerId    : o.id,
+          status     : 'ACTIVE',
+          link       : `${process.env.FRONTEND_URL}/checkout/${o.slug}?ref=${affiliateCode}`,
+        },
+      });
+      created.push({ offerId: o.id, created: true, enrollmentId: enr.id, status: enr.status });
+    }
+
+    return created;
+  }
+
+  // POST /affiliates/enroll — se inscrever em todas as ofertas do produto da oferta indicada
   app.post('/enroll', { preHandler: [authenticate] }, async (req, reply) => {
     const { offerId } = z.object({ offerId: z.string() }).parse(req.body);
 
@@ -359,33 +478,32 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       return reply.status(422).send({ message: 'Você não pode se afiliar a uma oferta do seu próprio produto.' });
     }
 
+    // Verifica se já existe enrollment BLOCKED na oferta solicitada
+    const myAff = await prisma.affiliate.findUnique({ where: { userId: req.user.sub }, select: { id: true } });
+    if (myAff) {
+      const existing = await prisma.affiliateEnrollment.findUnique({
+        where: { affiliateId_offerId: { affiliateId: myAff.id, offerId } },
+      });
+      if (existing?.status === 'BLOCKED') {
+        return reply.status(403).send({ message: 'Você foi removido desta oferta pelo produtor e não pode se inscrever novamente.' });
+      }
+    }
+
     // Criar perfil de afiliado se não existir
     let affiliate = await prisma.affiliate.findUnique({ where: { userId: req.user.sub } });
     if (!affiliate) {
       affiliate = await prisma.affiliate.create({
-        data: {
-          userId: req.user.sub,
-          code  : createId().slice(0, 8).toUpperCase(),
-        },
+        data: { userId: req.user.sub, code: createId().slice(0, 8).toUpperCase() },
       });
     }
 
-    // Verificar se já inscrito
-    const existing = await prisma.affiliateEnrollment.findUnique({
-      where: { affiliateId_offerId: { affiliateId: affiliate.id, offerId } },
-    });
-    if (existing) return reply.send(existing);
+    const results = await enrollAffiliateInAllProductOffers(affiliate.id, affiliate.code, offerId);
+    if (!results) return reply.status(404).send({ message: 'Oferta não encontrada' });
 
-    const enrollment = await prisma.affiliateEnrollment.create({
-      data: {
-        affiliateId: affiliate.id,
-        offerId,
-        status     : 'ACTIVE',
-        link       : `${process.env.FRONTEND_URL}/checkout/${(await prisma.offer.findUnique({ where: { id: offerId }, select: { slug: true } }))?.slug}?ref=${affiliate.code}`,
-      },
+    return reply.status(201).send({
+      message    : 'Inscrito com sucesso. Você recebeu o link de afiliação para todas as ofertas deste produto.',
+      enrollments: results,
     });
-
-    return reply.status(201).send(enrollment);
   });
 
   // GET /affiliates/my-enrollments — minhas inscrições e links
@@ -802,6 +920,15 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     const affiliate = await prisma.affiliate.findUnique({ where: { code: affiliateCode } });
     if (!affiliate) return reply.status(404).send({ message: 'Afiliado não encontrado' });
 
+    // Se o afiliado foi BLOCKED nesta oferta, não rastreia (link silencioso)
+    const enrollment = await prisma.affiliateEnrollment.findUnique({
+      where: { affiliateId_offerId: { affiliateId: affiliate.id, offerId } },
+      select: { status: true },
+    });
+    if (enrollment?.status === 'BLOCKED') {
+      return reply.send({ ok: false, blocked: true });
+    }
+
     await prisma.affiliateTracking.create({
       data: {
         affiliateId: affiliate.id,
@@ -979,17 +1106,15 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     const existing = await prisma.affiliateEnrollment.findUnique({
       where: { affiliateId_offerId: { affiliateId: affiliate.id, offerId: offer.id } },
     });
-    if (existing) return reply.send({ alreadyEnrolled: true, enrollment: existing });
+    if (existing?.status === 'BLOCKED') {
+      return reply.status(403).send({ message: 'Você foi removido desta oferta pelo produtor e não pode se inscrever novamente.' });
+    }
 
-    const enrollment = await prisma.affiliateEnrollment.create({
-      data: {
-        affiliateId: affiliate.id,
-        offerId    : offer.id,
-        status     : 'ACTIVE',
-        link       : `${process.env.FRONTEND_URL}/checkout/${offer.slug}?ref=${affiliate.code}`,
-      },
+    const results = await enrollAffiliateInAllProductOffers(affiliate.id, affiliate.code, offer.id);
+
+    return reply.status(201).send({
+      alreadyEnrolled: !!existing,
+      enrollments    : results || [],
     });
-
-    return reply.status(201).send({ alreadyEnrolled: false, enrollment });
   });
 }

@@ -167,7 +167,7 @@ export async function productRoutes(app: FastifyInstance) {
   // GET /products/vitrine — produtos aprovados (público)
   app.get('/vitrine/list', async (_req, reply) => {
     const products = await prisma.product.findMany({
-      where: { status: 'APPROVED', isActive: true, deletedAt: null },
+      where: { status: 'APPROVED', isActive: true, deletedAt: null, showInMarketplace: true },
       include: { offers: { where: { isActive: true }, select: { priceCents: true, name: true, slug: true } } },
       orderBy: { createdAt: 'desc' },
     });

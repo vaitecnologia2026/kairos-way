@@ -132,7 +132,10 @@ export const customerRoutes: FastifyPluginAsync = async (app) => {
             priceCents    : true,
             slug          : true,
             product       : {
-              select: { name: true, imageUrl: true, type: true },
+              select: {
+                id: true, name: true, imageUrl: true, type: true, digitalUrl: true,
+                membersArea: { select: { id: true } },
+              },
             },
             checkoutConfig: { select: { guaranteeDays: true } },
           },
@@ -283,6 +286,7 @@ export const customerRoutes: FastifyPluginAsync = async (app) => {
     const products = await prisma.product.findMany({
       where: {
         status: 'APPROVED',
+        showInMarketplace: true,
         ...(type   ? { type: type as any } : {}),
         ...(search ? { name: { contains: search, mode: 'insensitive' } } : {}),
       },

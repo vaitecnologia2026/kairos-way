@@ -246,7 +246,11 @@ export async function checkoutRoutes(app: FastifyInstance) {
           // A comissão do afiliado SAI da parte do PRODUTOR — nunca é somada ao total
           if (order.affiliateId) {
             const affiliate = await tx.affiliate.findUnique({ where: { id: order.affiliateId } });
-            if (affiliate) {
+            const enrollment = affiliate ? await tx.affiliateEnrollment.findUnique({
+              where: { affiliateId_offerId: { affiliateId: affiliate.id, offerId: offer.id } },
+              select: { status: true },
+            }) : null;
+            if (affiliate && enrollment?.status !== 'BLOCKED') {
               const config = await tx.affiliateConfig.findUnique({
                 where: { offerId: offer.id, enabled: true },
               });
