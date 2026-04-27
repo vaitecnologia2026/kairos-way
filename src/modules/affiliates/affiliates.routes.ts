@@ -517,7 +517,10 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       where  : { affiliateId: affiliate.id },
       include: {
         offer: {
-          include: {
+          select: {
+            id: true, name: true, slug: true, priceCents: true, type: true,
+            isActive: true, deletedAt: true,
+            subscriptionCycle: true, subscriptionMonths: true,
             product        : { select: { name: true, imageUrl: true, status: true, deletedAt: true, producerId: true } },
             affiliateConfig: { select: { commissionBps: true } },
             splitRules     : { where: { isActive: true }, select: { basisPoints: true } },
@@ -549,15 +552,23 @@ export async function affiliatesRoutes(app: FastifyInstance) {
         }),
       ]);
 
+      const commissionBps = e.offer.affiliateConfig?.commissionBps || 0;
+      const commissionPerSaleCents = Math.floor(e.offer.priceCents * commissionBps / 10000);
+
       return {
         id           : e.id,
         offerId      : e.offerId,
         offerSlug    : e.offer.slug,
+        offerType    : e.offer.type,
+        priceCents   : e.offer.priceCents,
+        subscriptionCycle : e.offer.subscriptionCycle,
+        subscriptionMonths: e.offer.subscriptionMonths,
         affiliateCode: affiliate.code,
         offerName    : e.offer.name,
         productName  : e.offer.product.name,
         productImage : e.offer.product.imageUrl,
-        commissionBps: e.offer.affiliateConfig?.commissionBps || 0,
+        commissionBps,
+        commissionPerSaleCents,
         link         : e.link, // legado — frontend deve usar offerSlug + affiliateCode
         status       : e.status,
         clicks,
