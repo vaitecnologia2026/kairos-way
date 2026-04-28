@@ -304,8 +304,8 @@ export async function adminRoutes(app: FastifyInstance) {
     ]);
 
     const rows = [
-      ...producers .map(p => ({ userId: p.userId, name: p.user.name, email: p.user.email, role: 'PRODUCER'  as const, customFees: p.customFees as any })),
-      ...affiliates.map(a => ({ userId: a.userId, name: a.user.name, email: a.user.email, role: 'AFFILIATE' as const, customFees: a.customFees as any })),
+      ...producers .map(p => ({ userId: p.userId, name: p.user.name, email: p.user.email, role: 'PRODUCER'  as const, customFees: p.customFees as any, customPlatformBps: (p as any).customPlatformBps ?? null })),
+      ...affiliates.map(a => ({ userId: a.userId, name: a.user.name, email: a.user.email, role: 'AFFILIATE' as const, customFees: a.customFees as any, customPlatformBps: (a as any).customPlatformBps ?? null })),
     ].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
     return reply.send({ data: rows, total: rows.length });
@@ -344,6 +344,35 @@ export async function adminRoutes(app: FastifyInstance) {
     });
 
     return reply.send({ message: toSave === null ? 'Taxa personalizada removida' : 'Taxa personalizada definida' });
+  });
+
+  // PUT /admin/fees/users/:userId/platform-bps — override % geral da plataforma
+  // Substitui a taxa de TODOS os métodos (PIX, BOLETO, CARD) com o BPS informado.
+  app.put('/fees/users/:userId/platform-bps', { preHandler: [authenticate, requireRole('ADMIN')] }, async (req, reply) => {
+    const { userId } = req.params as { userId: string };
+    const body = z.object({
+      bps: z.number().int().min(0).max(5000).nullable(), // 0–50% ou null para remover
+    }).parse(req.body);
+
+    const [producer, affiliate] = await Promise.all([
+      prisma.producer.findUnique({ where: { userId }, select: { id: true } }),
+      prisma.affiliate.findUnique({ where: { userId }, select: { id: true } }),
+    ]);
+    if (!producer && !affiliate) {
+      return reply.status(404).send({ message: 'Usuário não é produtor nem afiliado' });
+    }
+
+    if (producer)  await prisma.producer .update({ where: { userId }, data: { customPlatformBps: body.bps } as any });
+    if (affiliate) await prisma.affiliate.update({ where: { userId }, data: { customPlatformBps: body.bps } as any });
+
+    await audit.log({
+      userId : req.user.sub, action: 'USER_CUSTOM_PLATFORM_BPS_SET',
+      details: { targetUserId: userId, bps: body.bps }, level: 'HIGH',
+    });
+
+    return reply.send({
+      message: body.bps === null ? 'Override removido — usa taxa geral' : `Taxa fixada em ${(body.bps / 100).toFixed(2)}%`,
+    });
   });
 
   // ══════════════════════════════════════════════════════════════════

@@ -116,11 +116,21 @@ export async function resolvePlatformFee(userId: string, method: PlatformMethod)
   isCustom: boolean;
 }> {
   const [producer, affiliate, platform] = await Promise.all([
-    prisma.producer .findUnique({ where: { userId }, select: { customFees: true } }),
-    prisma.affiliate.findUnique({ where: { userId }, select: { customFees: true } }),
+    prisma.producer .findUnique({ where: { userId }, select: { customFees: true, customPlatformBps: true } }),
+    prisma.affiliate.findUnique({ where: { userId }, select: { customFees: true, customPlatformBps: true } }),
     getPlatformFees(),
   ]);
 
+  // 1) Override único: customPlatformBps substitui o BPS da taxa em TODOS os métodos
+  const overrideBps = producer?.customPlatformBps ?? affiliate?.customPlatformBps ?? null;
+  if (overrideBps !== null && overrideBps >= 0) {
+    return {
+      part    : { bps: overrideBps, ...(platform[method].cents ? { cents: platform[method].cents } : {}) },
+      isCustom: true,
+    };
+  }
+
+  // 2) Legado: matriz por método (deprecated, mas ainda respeitada se preenchida)
   const customFees = (producer?.customFees ?? affiliate?.customFees ?? null) as Partial<Record<PlatformMethod, FeePart>> | null;
   const customPart = customFees?.[method];
   const hasCustom  = isFilled(customPart);
