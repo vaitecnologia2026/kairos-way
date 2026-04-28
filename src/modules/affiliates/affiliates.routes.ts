@@ -89,10 +89,11 @@ export async function affiliatesRoutes(app: FastifyInstance) {
   app.post('/offers/:offerId/config', { preHandler: [authenticate, requireRole('PRODUCER', 'ADMIN')] }, async (req, reply) => {
     const { offerId } = req.params as { offerId: string };
     const body = z.object({
-      enabled      : z.boolean(),
-      commissionBps: z.number().int().min(100).max(5000), // 1% a 50%
-      cookieDays   : z.number().int().min(1).max(90).default(30),
-      description  : z.string().max(200).optional(),
+      enabled                : z.boolean(),
+      commissionBps          : z.number().int().min(100).max(5000), // 1% a 50%
+      coproducerCommissionBps: z.number().int().min(0).max(2000).optional().default(0), // 0% a 20%
+      cookieDays             : z.number().int().min(1).max(90).default(30),
+      description            : z.string().max(200).optional(),
     }).parse(req.body);
 
     const offer = await prisma.offer.findUnique({
@@ -405,12 +406,20 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     affiliateId: string,
     affiliateCode: string,
     primaryOfferId: string,
+    referrerCode?: string | null,
   ) {
     const primaryOffer = await prisma.offer.findUnique({
       where : { id: primaryOfferId },
       select: { productId: true },
     });
     if (!primaryOffer) return null;
+
+    // Resolve upline (afiliado que indicou): valida que existe, está ativo e não é ele mesmo
+    let referredByAffiliateId: string | null = null;
+    if (referrerCode && referrerCode !== affiliateCode) {
+      const upline = await prisma.affiliate.findUnique({ where: { code: referrerCode }, select: { id: true } });
+      if (upline && upline.id !== affiliateId) referredByAffiliateId = upline.id;
+    }
 
     const candidateOffers = await prisma.offer.findMany({
       where: {
@@ -430,7 +439,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
 
     const existing = await prisma.affiliateEnrollment.findMany({
       where  : { affiliateId, offerId: { in: validOffers.map(o => o.id) } },
-      select : { offerId: true, status: true, id: true },
+      select : { offerId: true, status: true, id: true, referredByAffiliateId: true },
     });
     const existingMap = new Map(existing.map(e => [e.offerId, e]));
 
@@ -439,6 +448,13 @@ export async function affiliatesRoutes(app: FastifyInstance) {
     for (const o of validOffers) {
       const existingEnr = existingMap.get(o.id);
       if (existingEnr) {
+        // Se já existe enrollment e ainda não tem upline, persiste o que veio agora (não sobrescreve outro upline)
+        if (referredByAffiliateId && !existingEnr.referredByAffiliateId) {
+          await prisma.affiliateEnrollment.update({
+            where: { id: existingEnr.id },
+            data : { referredByAffiliateId },
+          });
+        }
         created.push({ offerId: o.id, created: false, enrollmentId: existingEnr.id, status: existingEnr.status });
         continue;
       }
@@ -448,6 +464,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
           offerId    : o.id,
           status     : 'ACTIVE',
           link       : `${process.env.FRONTEND_URL}/checkout/${o.slug}?ref=${affiliateCode}`,
+          referredByAffiliateId,
         },
       });
       created.push({ offerId: o.id, created: true, enrollmentId: enr.id, status: enr.status });
@@ -458,7 +475,10 @@ export async function affiliatesRoutes(app: FastifyInstance) {
 
   // POST /affiliates/enroll — se inscrever em todas as ofertas do produto da oferta indicada
   app.post('/enroll', { preHandler: [authenticate] }, async (req, reply) => {
-    const { offerId } = z.object({ offerId: z.string() }).parse(req.body);
+    const { offerId, referrerCode } = z.object({
+      offerId     : z.string(),
+      referrerCode: z.string().optional(),  // código do afiliado upline que indicou (opcional)
+    }).parse(req.body);
 
     const config = await prisma.affiliateConfig.findUnique({ where: { offerId, enabled: true } });
     if (!config) return reply.status(404).send({ message: 'Oferta não disponível para afiliação' });
@@ -497,12 +517,76 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       });
     }
 
-    const results = await enrollAffiliateInAllProductOffers(affiliate.id, affiliate.code, offerId);
+    const results = await enrollAffiliateInAllProductOffers(affiliate.id, affiliate.code, offerId, referrerCode);
     if (!results) return reply.status(404).send({ message: 'Oferta não encontrada' });
 
     return reply.status(201).send({
       message    : 'Inscrito com sucesso. Você recebeu o link de afiliação para todas as ofertas deste produto.',
       enrollments: results,
+    });
+  });
+
+  // GET /affiliates/my-coproductions — produtos onde tenho afiliados abaixo (downline)
+  app.get('/my-coproductions', { preHandler: [authenticate] }, async (req, reply) => {
+    const affiliate = await prisma.affiliate.findUnique({ where: { userId: req.user.sub }, select: { id: true } });
+    if (!affiliate) return reply.send([]);
+
+    // Pega todos enrollments onde ESTE afiliado é o referredBy
+    const downline = await prisma.affiliateEnrollment.findMany({
+      where  : { referredByAffiliateId: affiliate.id },
+      include: {
+        affiliate: { include: { user: { select: { id: true, name: true, email: true } } } },
+        offer: {
+          select: {
+            id: true, name: true, slug: true, priceCents: true,
+            product: { select: { id: true, name: true, imageUrl: true } },
+            affiliateConfig: { select: { coproducerCommissionBps: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    // Soma comissões já pagas a este usuário como upline (recipientType=COPRODUCER)
+    const earnings = await prisma.splitRecord.groupBy({
+      by    : ['orderId'],
+      where : { recipientType: 'COPRODUCER', recipientId: req.user.sub },
+      _sum  : { amountCents: true },
+    });
+    const totalEarnedCents = earnings.reduce((s, e) => s + (e._sum.amountCents || 0), 0);
+
+    // Agrupa por produto
+    const byProduct = new Map<string, any>();
+    for (const e of downline) {
+      const pid = e.offer.product.id;
+      if (!byProduct.has(pid)) {
+        byProduct.set(pid, {
+          productId   : pid,
+          productName : e.offer.product.name,
+          productImage: e.offer.product.imageUrl,
+          downlineCount: 0,
+          downline    : [] as any[],
+        });
+      }
+      const entry = byProduct.get(pid)!;
+      entry.downlineCount += 1;
+      entry.downline.push({
+        affiliateId  : e.affiliate.id,
+        affiliateCode: e.affiliate.code,
+        name         : e.affiliate.user?.name,
+        email        : e.affiliate.user?.email,
+        offerId      : e.offerId,
+        offerName    : e.offer.name,
+        priceCents   : e.offer.priceCents,
+        coproducerBps: e.offer.affiliateConfig?.coproducerCommissionBps || 0,
+        enrolledAt   : e.createdAt,
+        status       : e.status,
+      });
+    }
+
+    return reply.send({
+      products        : Array.from(byProduct.values()),
+      totalEarnedCents,
     });
   });
 
@@ -1001,11 +1085,12 @@ export async function affiliatesRoutes(app: FastifyInstance) {
   app.post('/invite/:offerSlug/register', async (req, reply) => {
     const { offerSlug } = req.params as { offerSlug: string };
     const body = z.object({
-      name    : z.string().min(2),
-      email   : z.string().email(),
-      password: z.string().min(6),
-      phone   : z.string().optional(),
-      document: z.string().optional(),
+      name        : z.string().min(2),
+      email       : z.string().email(),
+      password    : z.string().min(6),
+      phone       : z.string().optional(),
+      document    : z.string().optional(),
+      referrerCode: z.string().optional(), // upline (afiliado que indicou) — vira co-produtor
     }).parse(req.body);
 
     const offer = await prisma.offer.findFirst({
@@ -1055,12 +1140,20 @@ export async function affiliatesRoutes(app: FastifyInstance) {
         },
       });
 
+      // Resolve upline (referredBy) se foi passado um referrerCode válido
+      let referredByAffiliateId: string | null = null;
+      if (body.referrerCode && body.referrerCode !== affiliate.code) {
+        const upline = await tx.affiliate.findUnique({ where: { code: body.referrerCode }, select: { id: true } });
+        if (upline) referredByAffiliateId = upline.id;
+      }
+
       const enrollment = await tx.affiliateEnrollment.create({
         data: {
           affiliateId: affiliate.id,
           offerId    : offer.id,
           status     : 'ACTIVE',
           link       : `${process.env.FRONTEND_URL}/checkout/${offer.slug}?ref=${affiliate.code}`,
+          referredByAffiliateId,
         },
       });
 
@@ -1080,6 +1173,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
   // POST /affiliates/invite/:offerSlug/enroll — afiliado já logado se afilia direto
   app.post('/invite/:offerSlug/enroll', { preHandler: [authenticate] }, async (req, reply) => {
     const { offerSlug } = req.params as { offerSlug: string };
+    const referrerCode = (req.body as any)?.referrerCode || (req.query as any)?.upline || undefined;
 
     const offer = await prisma.offer.findFirst({
       where : { slug: offerSlug, isActive: true, deletedAt: null },
@@ -1121,7 +1215,7 @@ export async function affiliatesRoutes(app: FastifyInstance) {
       return reply.status(403).send({ message: 'Você foi removido desta oferta pelo produtor e não pode se inscrever novamente.' });
     }
 
-    const results = await enrollAffiliateInAllProductOffers(affiliate.id, affiliate.code, offer.id);
+    const results = await enrollAffiliateInAllProductOffers(affiliate.id, affiliate.code, offer.id, referrerCode);
 
     return reply.status(201).send({
       alreadyEnrolled: !!existing,

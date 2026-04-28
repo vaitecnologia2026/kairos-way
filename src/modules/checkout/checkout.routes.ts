@@ -250,7 +250,7 @@ export async function checkoutRoutes(app: FastifyInstance) {
             const affiliate = await tx.affiliate.findUnique({ where: { id: order.affiliateId } });
             const enrollment = affiliate ? await tx.affiliateEnrollment.findUnique({
               where: { affiliateId_offerId: { affiliateId: affiliate.id, offerId: offer.id } },
-              select: { status: true },
+              select: { status: true, referredByAffiliateId: true },
             }) : null;
             if (affiliate && enrollment?.status !== 'BLOCKED') {
               const config = await tx.affiliateConfig.findUnique({
@@ -258,7 +258,13 @@ export async function checkoutRoutes(app: FastifyInstance) {
               });
               if (config && config.commissionBps > 0) {
                 const commissionCents = Math.floor(order.amountCents * config.commissionBps / 10000);
-                if (commissionCents > 0) {
+                // Override do co-produtor (afiliado upline que indicou esse afiliado)
+                const coproducerBps = config.coproducerCommissionBps || 0;
+                const coproducerCents = enrollment?.referredByAffiliateId && coproducerBps > 0
+                  ? Math.floor(order.amountCents * coproducerBps / 10000)
+                  : 0;
+                const totalDeduction = commissionCents + coproducerCents;
+                if (totalDeduction > 0) {
                   // Buscar o split record do PRODUTOR para descontar a comissão
                   const producerRecord = await tx.splitRecord.findFirst({
                     where: { orderId: order.id, recipientType: 'PRODUCER' },
@@ -269,34 +275,53 @@ export async function checkoutRoutes(app: FastifyInstance) {
                     return;
                   }
 
-                  const producerAfterCommission = producerRecord.amountCents - commissionCents;
+                  const producerAfterCommission = producerRecord.amountCents - totalDeduction;
                   if (producerAfterCommission < 0) {
-                    logger.error({ orderId: order.id, commissionCents, producerCents: producerRecord.amountCents },
-                      'Comissão do afiliado excede o valor do produtor — comissão não registrada');
+                    logger.error({ orderId: order.id, totalDeduction, producerCents: producerRecord.amountCents },
+                      'Comissões (afiliado + co-produtor) excedem o valor do produtor — não registradas');
                     return;
                   }
 
-                  // Reduzir o split do produtor pelo valor da comissão
+                  // Reduzir o split do produtor pelo total descontado
                   await tx.splitRecord.update({
                     where: { id: producerRecord.id },
                     data : { amountCents: producerAfterCommission },
                   });
 
-                  // Criar o split do afiliado com o mesmo splitRuleId do produtor como referência
-                  await tx.splitRecord.create({
-                    data: {
-                      orderId      : order.id,
-                      splitRuleId  : producerRecord.splitRuleId,
-                      recipientType: 'AFFILIATE',
-                      recipientId  : affiliate.userId,
-                      amountCents  : commissionCents,
-                      status       : 'PENDING',
-                    },
-                  });
+                  if (commissionCents > 0) {
+                    await tx.splitRecord.create({
+                      data: {
+                        orderId      : order.id,
+                        splitRuleId  : producerRecord.splitRuleId,
+                        recipientType: 'AFFILIATE',
+                        recipientId  : affiliate.userId,
+                        amountCents  : commissionCents,
+                        status       : 'PENDING',
+                      },
+                    });
+                    notifAffiliateUserId = affiliate.userId;
+                    notifCommissionCents = commissionCents;
+                  }
 
-                  // Capturar para notificação (fora da transação)
-                  notifAffiliateUserId = affiliate.userId;
-                  notifCommissionCents = commissionCents;
+                  // Split do co-produtor (afiliado upline)
+                  if (coproducerCents > 0 && enrollment?.referredByAffiliateId) {
+                    const upline = await tx.affiliate.findUnique({
+                      where : { id: enrollment.referredByAffiliateId },
+                      select: { userId: true },
+                    });
+                    if (upline) {
+                      await tx.splitRecord.create({
+                        data: {
+                          orderId      : order.id,
+                          splitRuleId  : producerRecord.splitRuleId,
+                          recipientType: 'COPRODUCER',
+                          recipientId  : upline.userId,
+                          amountCents  : coproducerCents,
+                          status       : 'PENDING',
+                        },
+                      });
+                    }
+                  }
                 }
               }
             }

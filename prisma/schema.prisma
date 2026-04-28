@@ -594,6 +594,8 @@ model Affiliate {
   trackings   AffiliateTracking[]
   orders      Order[]
   enrollments AffiliateEnrollment[]
+  // Pirâmide: afiliados que ESTE afiliado indicou (downline)
+  downlineEnrollments AffiliateEnrollment[] @relation("AffiliateReferrals")
 
   @@index([code])
 }
@@ -614,14 +616,17 @@ model AffiliateTracking {
 }
 
 model AffiliateConfig {
-  id            String   @id @default(cuid())
-  offerId       String   @unique
-  enabled       Boolean  @default(true)
-  commissionBps Int
-  cookieDays    Int      @default(30)
-  description   String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id                     String   @id @default(cuid())
+  offerId                String   @unique
+  enabled                Boolean  @default(true)
+  commissionBps          Int
+  // % que o "co-produtor" (afiliado upline que indicou este afiliado) recebe.
+  // Sai da parte do produtor; soma com a comissão direta do afiliado vendedor.
+  coproducerCommissionBps Int     @default(0)
+  cookieDays             Int      @default(30)
+  description            String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
 
   offer Offer @relation(fields: [offerId], references: [id], onDelete: Cascade)
 
@@ -629,19 +634,24 @@ model AffiliateConfig {
 }
 
 model AffiliateEnrollment {
-  id          String   @id @default(cuid())
-  affiliateId String
-  offerId     String
-  status      String   @default("ACTIVE")
-  link        String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id                    String   @id @default(cuid())
+  affiliateId           String
+  offerId               String
+  status                String   @default("ACTIVE")
+  link                  String
+  // Pirâmide: quem indicou este afiliado para essa oferta. Quando este afiliado vende,
+  // o referredBy ganha override (coproducerCommissionBps) sobre a venda.
+  referredByAffiliateId String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 
-  affiliate Affiliate @relation(fields: [affiliateId], references: [id], onDelete: Cascade)
-  offer     Offer     @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  affiliate  Affiliate  @relation(fields: [affiliateId], references: [id], onDelete: Cascade)
+  offer      Offer      @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  referredBy Affiliate? @relation("AffiliateReferrals", fields: [referredByAffiliateId], references: [id], onDelete: SetNull)
 
   @@unique([affiliateId, offerId])
   @@index([affiliateId])
+  @@index([referredByAffiliateId])
   @@index([offerId])
 }
 
