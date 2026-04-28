@@ -251,6 +251,23 @@ export class AuthService {
     );
   }
 
+  // ── MFA DISABLE ──────────────────────────────────────────────
+  // Exige a senha atual para confirmar (mesmo padrão de change-password).
+  async disableMfa(userId: string, currentPassword: string) {
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new NotFoundError('Usuário');
+    if (!user.mfaEnabled) throw new AppError('MFA já está desativado');
+
+    const valid = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!valid) throw new UnauthorizedError('Senha atual incorreta');
+
+    await prisma.user.update({
+      where: { id: userId },
+      data : { mfaEnabled: false, mfaSecret: null },
+    });
+    await auditService.log({ userId, action: 'MFA_DISABLED', level: 'HIGH' });
+  }
+
   // ── CHANGE PASSWORD ──────────────────────────────────────────
   async changePassword(userId: string, currentPassword: string, newPassword: string) {
     const user = await prisma.user.findUnique({ where: { id: userId } });

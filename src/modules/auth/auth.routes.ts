@@ -96,6 +96,13 @@ export async function authRoutes(app: FastifyInstance) {
     return reply.send({ message: 'MFA ativado com sucesso' });
   });
 
+  // POST /auth/mfa/disable (exige senha atual; remove o MFA do usuário)
+  app.post('/mfa/disable', { preHandler: [authenticate] }, async (request, reply) => {
+    const body = z.object({ currentPassword: z.string().min(1) }).parse(request.body);
+    await authService.disableMfa(request.user.sub, body.currentPassword);
+    return reply.send({ message: 'MFA desativado com sucesso' });
+  });
+
   // PUT /auth/password
   app.put('/password', { preHandler: [authenticate] }, async (request, reply) => {
     const body = z.object({
